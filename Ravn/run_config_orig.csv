@@ -1,0 +1,16 @@
+var,Ravn
+start_time,1/1/2022 00:00
+end_time,12/31/2023 11:59:00 PM
+nx,64
+dt,3600
+dx,0.5
+pgdl_mode,on
+training_data_path,./output/Ravn
+diffusion_method,hendersonSellers
+scheme,implicit
+u_ini_file,./input/Ravn/L0001-HD.csv
+wq_ini_file,./input/Ravn/L0001-WQ.csv
+tp_ini_file,./input/Ravn/L0001-WQ-inflow.csv
+oc_load_file,./input/Ravn/oc_load_file.csv
+hypso_ini_file,./input/Ravn/L0001-Bathy.csv
+meteo_ini_file,./input/Ravn/L0001-MET.csv
