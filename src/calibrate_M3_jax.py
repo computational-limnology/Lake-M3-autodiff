@@ -82,6 +82,23 @@ This script still checks every gradient for finiteness each iteration and
 stops early (keeping the best result so far) if a chunk ever does produce
 a non-finite gradient.
 
+Chunking is implemented as a *nested* `lax.scan` -- an outer scan over
+chunks wrapping the existing per-step scan within each chunk (padding the
+forcing series up to a whole number of chunks first, then trimming the
+padding back off the output) -- rather than a plain Python `for` loop over
+chunks. This matters for compile time, not just runtime: a Python loop is
+unrolled at trace time, so `jax.jit` would bake one full copy of the
+per-chunk computation into the compiled program *for every chunk*, making
+compiled-program size (and compile time) grow with the total simulation
+length. At a handful of chunks that's unnoticeable; at the default full
+multi-year record (~22 chunks of 2000 steps), it made compilation itself
+slow to the point of stalling or failing outright -- before ever reaching
+the actual simulation. The nested-scan version compiles the chunk-body
+computation exactly once and reuses it via the scan's own loop mechanism,
+so compile time/size stay roughly constant regardless of how many chunks
+the record needs. Numerically and for gradient-truncation purposes it is
+identical to the old loop -- only how it gets compiled changed.
+
 Parameter selection ("sensitive" parameters): rather than guessing a fixed
 list, this script screens a documented pool of `model_params.csv` entries
 that `default_params()` actually uses (CANDIDATE_PARAMS below -- excluding
@@ -100,7 +117,15 @@ which is one extra backward pass per present variable, not a separate
 model run each). The per-variable ranking exists because a parameter can
 be highly influential for one variable (e.g. a light-attenuation
 parameter for DOC) while contributing little to the combined loss simply
-because that loss is dominated by a differently-scaled variable.
+because that loss is dominated by a differently-scaled variable. Note
+that "one extra backward pass per present variable" is still real cost,
+not a free byproduct of the one forward pass: with all three of
+temp/O2/DOC present, the per-variable screen genuinely takes roughly 3x
+as long as the combined screen above, since `jacrev` runs one backward
+pass per output component. Both screens print how long they actually
+took (blocking on the result first -- `jax.jit` dispatches
+asynchronously, so timing the call itself without forcing completion
+understates the real cost, sometimes badly).
 
 By default (`--select-mode per-variable`), the parameters actually
 calibrated are the *union* of each present variable's top
@@ -314,22 +339,16 @@ def extract_pairs(per_step, obs):
     return pairs
 
 
-def compute_metrics(params, geometry, forcing, ice_state, init_state, obs, chunk_steps):
-    """Run the model once at `params` (via the same chunked
-    `simulate_truncated` used for training -- gradients aren't needed
-    here, but reusing it keeps the forward trajectory identical) and
-    compute RMSE/NSE/KGE/R2 for every variable that has observations,
-    over exactly the (step, depth) pairs the loss function scores.
-
-    `jax.jit`-wrapped here (rather than run eagerly): with no wrapping
-    jit, every op in `simulate_truncated` dispatches one at a time,
-    which is dramatically slower over a multi-thousand-step trajectory
-    than one fused/optimized XLA program -- the difference that made an
-    early version of this function the slow part of a calibration run.
+def compute_metrics(sim_fn, params, obs):
+    """Run the model once at `params` via the already-`jax.jit`-compiled
+    `sim_fn` (built once in `main()` from `simulate_truncated` and reused
+    for both the initial and calibrated parameters -- same compiled
+    program either way, since only the parameter *values* differ, not
+    their shapes/dtypes/keys, so the second call is a cache hit rather
+    than a second compile) and compute RMSE/NSE/KGE/R2 for every variable
+    that has observations, over exactly the (step, depth) pairs the loss
+    function scores.
     """
-    sim_fn = jax.jit(
-        lambda p: simulate_truncated(p, geometry, forcing, ice_state, init_state, chunk_steps)
-    )
     per_step = sim_fn(params)
     pairs = extract_pairs(per_step, obs)
     metrics = {}
@@ -376,12 +395,22 @@ def simulate_truncated(params, geometry, forcing, ice_state, init_state, chunk_s
     state-to-state gradient paths survive backpropagation); only the
     gradient differs from an (unstable, exploding) un-chunked one.
 
+    Implemented as a *nested* `lax.scan` (outer scan over chunks, wrapping
+    the inner per-step scan within a chunk) rather than a Python loop over
+    chunks, so the compiled program is the same size regardless of how
+    many chunks the record needs -- see module docstring. `chunk_steps`
+    need not evenly divide the record: the forcing series is padded up to
+    a whole number of chunks first (by repeating its last real row, so the
+    padded tail is physically boring rather than an artificial spike) and
+    the padding is trimmed back off the output before returning, invisibly
+    to every caller.
+
     Returns a `per_step` dict with keys u/o2/docr/docl/pocr/pocl, each
-    shape (n_steps, nx) -- same shape/keys `run_full_model` returns,
-    concatenated across chunks. This does mean the whole trajectory's
-    output is held in memory at once (a few hundred MB at most for this
-    model's nx=64 and multi-year record); that's an acceptable trade for
-    keeping the loss/metrics code identical regardless of chunking.
+    shape (n_steps, nx) -- same shape/keys `run_full_model` returns. This
+    does mean the whole trajectory's output is held in memory at once (a
+    few hundred MB at most for this model's nx=64 and multi-year record);
+    that's an acceptable trade for keeping the loss/metrics code identical
+    regardless of chunking.
     """
     u0, o2_0, docr_0, docl_0, pocr_0, pocl_0 = init_state
     nx = u0.shape[0]
@@ -389,7 +418,21 @@ def simulate_truncated(params, geometry, forcing, ice_state, init_state, chunk_s
         u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, nx, **ice_state,
     )
     n_steps = forcing["Uw"].shape[0]
-    bounds = make_chunk_bounds(n_steps, chunk_steps)
+    n_chunks = -(-n_steps // chunk_steps)  # ceil division
+    n_padded = n_chunks * chunk_steps
+    pad = n_padded - n_steps
+
+    if pad > 0:
+        forcing_padded = {
+            k: jnp.concatenate([v, jnp.broadcast_to(v[-1], (pad,) + v.shape[1:])], axis=0)
+            for k, v in forcing.items()
+        }
+    else:
+        forcing_padded = forcing
+
+    forcing_chunked = jax.tree_util.tree_map(
+        lambda v: v.reshape((n_chunks, chunk_steps) + v.shape[1:]), forcing_padded,
+    )
 
     # `jax.checkpoint` (gradient checkpointing / rematerialization) on the
     # per-step body: without it, differentiating through `lax.scan` needs
@@ -402,23 +445,33 @@ def simulate_truncated(params, geometry, forcing, ice_state, init_state, chunk_s
     # on demand instead of storing them, trading ~2x extra compute for
     # memory that no longer scales with chunk length.
     @jax.checkpoint
-    def body(s, forcing_t):
+    def step_body(s, forcing_t):
         new_s, _ = full_step(s, forcing_t, geometry, params)
         outputs = dict(
             u=new_s.u, o2=new_s.o2, docr=new_s.docr, docl=new_s.docl, pocr=new_s.pocr, pocl=new_s.pocl,
         )
         return new_s, outputs
 
-    per_step_chunks = []
-    for start, end in bounds:
-        forcing_c = {k: v[start:end] for k, v in forcing.items()}
-        state, per_step_c = lax.scan(body, state, forcing_c)
-        per_step_chunks.append(per_step_c)
+    # Checkpointed again at the chunk level, for the same reason: without
+    # it, backpropagating through the *outer* scan would keep every
+    # chunk's forward residuals live at once (scaling with chunk COUNT,
+    # i.e. with total simulation length again, just one level up); with
+    # it, only the small state carry is kept between chunks, and each
+    # chunk's own (already-checkpointed) inner scan is recomputed on
+    # demand during the backward pass.
+    @jax.checkpoint
+    def chunk_body(s, forcing_chunk):
+        s, per_step_c = lax.scan(step_body, s, forcing_chunk)
         # Truncate BPTT here: gradients flow freely *within* the chunk
         # just completed, but not from later chunks back into it.
-        state = jax.tree_util.tree_map(lax.stop_gradient, state)
+        s = jax.tree_util.tree_map(lax.stop_gradient, s)
+        return s, per_step_c
 
-    return {k: jnp.concatenate([c[k] for c in per_step_chunks], axis=0) for k in per_step_chunks[0]}
+    _, per_step_chunked = lax.scan(chunk_body, state, forcing_chunked)
+    return {
+        k: v.reshape((n_padded,) + v.shape[2:])[:n_steps]
+        for k, v in per_step_chunked.items()
+    }
 
 
 def make_loss_fn(base_params, geometry, forcing, ice_state, init_state, obs, weights, chunk_steps):
@@ -590,8 +643,18 @@ def main():
     print(f"\nRunning sensitivity screen over {len(candidates)} candidate parameters "
           f"({n_steps} steps across {n_chunks} chunk(s) -- this runs the model once, jitted)...")
     t0 = time.time()
-    screen_grad_fn = jax.jit(jax.value_and_grad(loss_fn))
-    val0, grad0 = screen_grad_fn(theta_log0)
+    # Shared across the screen and the Adam loop below (rather than two
+    # separately-constructed jax.jit wrappers around the same loss_fn) --
+    # they're called with different-sized parameter dicts (all candidates
+    # vs. the selected subset) so each still compiles once regardless, but
+    # there's no reason to build two wrapper objects for one function.
+    grad_fn = jax.jit(jax.value_and_grad(loss_fn))
+    val0, grad0 = grad_fn(theta_log0)
+    jax.block_until_ready((val0, grad0))  # jax.jit dispatches asynchronously --
+    # without forcing completion here, this timing (and every other one in this
+    # script) would only measure dispatch, not the actual compute, making a
+    # slow call look deceptively fast right up until something later actually
+    # reads a value and blocks for the real duration.
     t1 = time.time()
     print(f"  baseline loss = {float(val0):.6g}  (screen took {t1 - t0:.1f}s)")
 
@@ -622,6 +685,7 @@ def main():
     t0 = time.time()
     jac_fn = jax.jit(jax.jacrev(per_var_loss_fn))
     jac = jac_fn(theta_log0)
+    jax.block_until_ready(jac)  # see note above -- force real completion before timing
     t1 = time.time()
     print(f"  (per-variable screen took {t1 - t0:.1f}s)")
 
@@ -668,7 +732,6 @@ def main():
 
     opt = optax.adam(args.lr)
     opt_state = opt.init(theta_log)
-    opt_grad_fn = jax.jit(jax.value_and_grad(loss_fn))
 
     print(f"\nRunning {args.iters} Adam iterations ({n_steps} steps/iteration across {n_chunks} "
           "gradient-truncated chunk(s), jitted -- first iteration includes compile time)...")
@@ -676,7 +739,8 @@ def main():
     history = [float(val0)]
     for it in range(args.iters):
         t0 = time.time()
-        loss_val, grads = opt_grad_fn(theta_log)
+        loss_val, grads = grad_fn(theta_log)
+        jax.block_until_ready((loss_val, grads))  # see note above on async dispatch
         non_finite = any(not bool(jnp.all(jnp.isfinite(v))) for v in grads.values()) or not np.isfinite(float(loss_val))
         if non_finite:
             print(f"  iter {it}: non-finite loss/gradient encountered -- stopping early "
@@ -708,8 +772,15 @@ def main():
     # --- per-variable RMSE/NSE/KGE/R2, initial vs. calibrated params ---
     params_final = dict(base_params)
     params_final.update({name: float(jnp.exp(v)) for name, v in best_theta_log.items() if name in selected})
-    metrics_initial = compute_metrics(base_params, geometry, forcing, ice_state, init_state, obs, args.chunk_steps)
-    metrics_final = compute_metrics(params_final, geometry, forcing, ice_state, init_state, obs, args.chunk_steps)
+    # Built once and reused for both calls below: `params`'s keys/shapes/
+    # dtypes are identical for the initial and calibrated parameter sets
+    # (only the values differ), so the second call is a compiled-cache
+    # hit rather than a second full compile of the whole simulation.
+    sim_fn = jax.jit(
+        lambda p: simulate_truncated(p, geometry, forcing, ice_state, init_state, args.chunk_steps)
+    )
+    metrics_initial = compute_metrics(sim_fn, base_params, obs)
+    metrics_final = compute_metrics(sim_fn, params_final, obs)
     print_metrics_table(
         "Evaluation metrics (computed at the same (step, depth) pairs the loss scores; "
         "NSE/KGE/R2: 1.0 = perfect fit):",
