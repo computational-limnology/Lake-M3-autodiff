@@ -11,7 +11,7 @@ oxygen "do" and dissolved organic carbon "doc", both in mg/L), using
 
 Usage:
     python src/calibrate_M3_jax.py Ravn [--steps N] [--chunk-steps N] [--iters K]
-        [--lr LR] [--topk K] [--params p1,p2,...] [--sensitivity-only]
+        [--lr LR] [--topk K] [--params p1,p2,...] [--variables temp,o2,doc] [--sensitivity-only]
 
 Key design choices
 -------------------
@@ -140,6 +140,21 @@ Adam (`optax`), in log-space (so a single learning rate means "N%
 relative step" for every parameter regardless of its raw scale, e.g.
 km ~ 1e-6 vs. theta_r ~ 1.2), under a box constraint keeping each
 parameter within [0.1x, 10x] of its starting value.
+
+Restricting which variables count towards calibration (`--variables`):
+by default every variable with observations in the window (temp/O2/DOC,
+whichever are present) contributes to the loss and to the sensitivity
+screens. `--variables temp` or `--variables o2,temp` (etc.) restricts
+this to a named subset -- e.g. "only calibrate against temperature" even
+though O2/DOC observations also exist in the window. The excluded
+variable(s) are dropped entirely from the loss (so their gradient
+contributes nothing) and from the per-variable sensitivity screen/
+selection, but -- since they cost nothing extra to compute, being read
+from the same forward simulation -- they are still reported in the final
+evaluation metrics table for reference, marked as "(not targeted)" so
+it's clear they didn't influence the fit. Requesting a variable with no
+observations in the window is an error (nothing to calibrate against for
+it), rather than silently ignored.
 
 Evaluation: after optimization, the model is run once more at the initial
 and at the calibrated parameters, and RMSE, NSE (Nash-Sutcliffe
@@ -360,18 +375,23 @@ def compute_metrics(sim_fn, params, obs):
     return metrics
 
 
-def print_metrics_table(title, metrics_initial, metrics_final):
+def print_metrics_table(title, metrics_initial, metrics_final, active_vars=None):
+    """`active_vars`, if given, marks variables that did NOT contribute to
+    the loss (e.g. excluded via --variables) as "(not targeted)" -- they
+    are still reported here since the forward simulation already produces
+    them at no extra cost, but they had no gradient influence on the fit."""
     print(f"\n{title}")
     header = f"  {'variable':10s} {'n':>5s} {'RMSE (init->cal)':>24s} {'NSE (init->cal)':>22s} " \
              f"{'KGE (init->cal)':>22s} {'R2 (init->cal)':>22s}"
     print(header)
     for name in metrics_final:
         mi, mf = metrics_initial[name], metrics_final[name]
+        flag = "  (not targeted)" if active_vars is not None and name not in active_vars else ""
         print(f"  {name:10s} {mf['n']:5d} "
               f"{mi['rmse']:10.4g} -> {mf['rmse']:<9.4g} "
               f"{mi['nse']:8.3f} -> {mf['nse']:<9.3f} "
               f"{mi['kge']:8.3f} -> {mf['kge']:<9.3f} "
-              f"{mi['r2']:8.3f} -> {mf['r2']:<9.3f}")
+              f"{mi['r2']:8.3f} -> {mf['r2']:<9.3f}{flag}")
 
 
 def make_chunk_bounds(n_steps, chunk_steps):
@@ -554,6 +574,12 @@ def main():
     parser.add_argument("--params", type=str, default=None,
                          help="comma-separated parameter names to calibrate directly, "
                               "bypassing the sensitivity screen")
+    parser.add_argument("--variables", type=str, default=None,
+                         help="comma-separated subset of temp,o2,doc to calibrate against "
+                              "(default: all of temp/o2/doc that have observations in the "
+                              "window). Excluded variables are dropped from the loss and "
+                              "sensitivity screens entirely, but still reported in the final "
+                              "evaluation metrics for reference.")
     parser.add_argument("--sensitivity-only", action="store_true",
                          help="only run and print the sensitivity screen, skip optimization")
     args = parser.parse_args()
@@ -628,13 +654,44 @@ def main():
         print(f"  {name}: {n} profile date(s) in window")
     weights = {name: obs_weight(obs[name]) for name in ("temp", "o2", "doc")}
 
-    if all(obs[name] is None for name in ("temp", "o2", "doc")):
+    present_vars = [name for name in ("temp", "o2", "doc") if obs[name] is not None]
+
+    if args.variables:
+        requested = [v.strip() for v in args.variables.split(",") if v.strip()]
+        unknown = [v for v in requested if v not in ("temp", "o2", "doc")]
+        if unknown:
+            raise SystemExit(f"--variables entries must be from temp,o2,doc: unknown {unknown}")
+        missing = [v for v in requested if v not in present_vars]
+        if missing:
+            raise SystemExit(
+                f"--variables requested {missing}, but there are no observations for "
+                f"{missing} in this {n_steps}-step window -- nothing to calibrate against "
+                "for them. Try a different --steps window, or drop them from --variables."
+            )
+        # canonical temp/o2/doc order regardless of how the user typed --variables
+        active_vars = [name for name in ("temp", "o2", "doc") if name in requested]
+    else:
+        active_vars = present_vars
+
+    if not active_vars:
         print("No observations fall inside the simulation window -- nothing to calibrate against. "
               "Try passing --steps explicitly (or a larger value), or check that "
               "run_config.csv's start_time overlaps L0001-HD.csv/L0001-WQ.csv's date range.")
         return
 
-    loss_fn = make_loss_fn(base_params, geometry, forcing, ice_state, init_state, obs, weights, args.chunk_steps)
+    excluded_vars = [v for v in present_vars if v not in active_vars]
+    print(f"  calibrating against: {active_vars}"
+          + (f"  (present but excluded by --variables: {excluded_vars})" if excluded_vars else ""))
+
+    # Variables left out of --variables are dropped from the loss entirely
+    # (rather than merely down-weighted) by hiding their observations from
+    # make_loss_fn/make_per_variable_loss_fn -- the full, unfiltered `obs`
+    # is still used for the final evaluation metrics, so an excluded
+    # variable is still reported (for reference) even though it never
+    # contributed a gradient.
+    obs_for_loss = {name: (obs[name] if name in active_vars else None) for name in ("temp", "o2", "doc")}
+
+    loss_fn = make_loss_fn(base_params, geometry, forcing, ice_state, init_state, obs_for_loss, weights, args.chunk_steps)
 
     # --- sensitivity screen ---
     candidates = [p for p in CANDIDATE_PARAMS if base_params.get(p) is not None]
@@ -676,12 +733,11 @@ def main():
     # run), so a parameter that matters a lot to one variable can't be
     # buried by the combined ranking just because a differently-scaled
     # variable dominates the combined loss. See module docstring.
-    present_vars = [name for name in ("temp", "o2", "doc") if obs[name] is not None]
     per_var_loss_fn = make_per_variable_loss_fn(
-        base_params, geometry, forcing, ice_state, init_state, obs, args.chunk_steps, present_vars,
+        base_params, geometry, forcing, ice_state, init_state, obs_for_loss, args.chunk_steps, active_vars,
     )
-    print(f"\nRunning per-variable sensitivity screen over {present_vars} "
-          f"({len(present_vars)} extra backward pass(es), same forward pass as above)...")
+    print(f"\nRunning per-variable sensitivity screen over {active_vars} "
+          f"({len(active_vars)} extra backward pass(es), same forward pass as above)...")
     t0 = time.time()
     jac_fn = jax.jit(jax.jacrev(per_var_loss_fn))
     jac = jac_fn(theta_log0)
@@ -690,14 +746,14 @@ def main():
     print(f"  (per-variable screen took {t1 - t0:.1f}s)")
 
     per_var_ranked = {}
-    for i, var in enumerate(present_vars):
+    for i, var in enumerate(active_vars):
         elast_var = {}
         for name in candidates:
             g = float(jac[name][i])
             elast_var[name] = abs(g) if np.isfinite(g) else -1.0
         per_var_ranked[var] = sorted(elast_var.items(), key=lambda kv: kv[1], reverse=True)
 
-    for var in present_vars:
+    for var in active_vars:
         print(f"\nTop {args.topk_per_variable} sensitivity ranking for '{var}' "
               f"(|d(loss_{var})/d(log param)|, unweighted, this variable only):")
         for name, e in per_var_ranked[var][: args.topk_per_variable]:
@@ -715,11 +771,11 @@ def main():
     elif args.select_mode == "combined":
         selected = [name for name, e in ranked if e >= 0][: args.topk]
     else:
-        # Union of each present variable's own top --topk-per-variable,
+        # Union of each active variable's own top --topk-per-variable,
         # order preserved by first appearance (temp's picks first, then
         # any new names from o2, then doc), duplicates dropped.
         selected = []
-        for var in present_vars:
+        for var in active_vars:
             for name, e in per_var_ranked[var][: args.topk_per_variable]:
                 if e >= 0 and name not in selected:
                     selected.append(name)
@@ -784,7 +840,7 @@ def main():
     print_metrics_table(
         "Evaluation metrics (computed at the same (step, depth) pairs the loss scores; "
         "NSE/KGE/R2: 1.0 = perfect fit):",
-        metrics_initial, metrics_final,
+        metrics_initial, metrics_final, active_vars,
     )
 
     out_path = os.path.join(os.getcwd(), "calibration_result.csv")
@@ -793,7 +849,7 @@ def main():
 
     metrics_rows = []
     for name in metrics_final:
-        row = dict(variable=name, n=metrics_final[name]["n"])
+        row = dict(variable=name, n=metrics_final[name]["n"], targeted=name in active_vars)
         for m in ("rmse", "nse", "kge", "r2"):
             row[f"{m}_initial"] = metrics_initial[name][m]
             row[f"{m}_calibrated"] = metrics_final[name][m]
