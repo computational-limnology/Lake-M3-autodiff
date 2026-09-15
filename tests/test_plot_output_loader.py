@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -66,3 +67,26 @@ def test_prepare_plot_arrays_keeps_temperature_unscaled_by_volume():
 
     assert np.allclose(arrays["temp"], res["temp"])
     assert np.allclose(arrays["o2"], np.array([[10.0, 6.0], [9.0, 5.5]]))
+
+
+def test_temperature_profiles_use_shallowest_and_deepest_observed_depths():
+    observations = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(["2020-01-01", "2020-01-02"]),
+            "Depth_meter": [10.0, 0.0],
+            "Water_Temperature_celsius": [4.0, 8.0],
+        }
+    )
+
+    figure = plot_output._plot_temperature_profiles(
+        temp=np.array([[8.0, 6.0, 4.0], [9.0, 7.0, 5.0]]),
+        time_values=np.array([0.0, 86400.0]),
+        depth_values=np.array([0.0, 5.0, 10.0]),
+        observations=observations,
+        start_time=pd.Timestamp("2020-01-01"),
+    )
+
+    assert [axis.get_title() for axis in figure.axes[:2]] == [
+        "Temperature at 0 m observed depth",
+        "Temperature at 10 m observed depth",
+    ]
