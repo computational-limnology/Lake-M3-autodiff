@@ -141,6 +141,16 @@ relative step" for every parameter regardless of its raw scale, e.g.
 km ~ 1e-6 vs. theta_r ~ 1.2), under a box constraint keeping each
 parameter within [0.1x, 10x] of its starting value.
 
+`--iters` is a ceiling, not a target: by default the Adam loop stops early
+once the loss has gone `--early-stop-patience` (default 5) consecutive
+iterations without improving by more than `--early-stop-tol` (default
+1e-4, relative to the best loss seen so far) -- Adam's own step-to-step
+noise means "no improvement over the last step" would trigger constantly,
+so this tracks stalling against the *best* loss seen, not just the
+previous iteration. `--early-stop-patience 0` disables this and always
+runs the full `--iters`. Either way the best iterate found (not
+necessarily the last one) is what gets reported/saved.
+
 Restricting which variables count towards calibration (`--variables`):
 by default every variable with observations in the window (temp/O2/DOC,
 whichever are present) contributes to the loss and to the sensitivity
@@ -200,6 +210,8 @@ from run_M3_jax import build_forcing_series, add_wq_forcing_series
 DEFAULT_CHUNK_STEPS = 2000   # ~83 days
 DEFAULT_ITERS = 20
 DEFAULT_LR = 0.05       # log-space Adam step ~= 5% relative parameter change
+DEFAULT_EARLY_STOP_PATIENCE = 5   # 0 disables early stopping (always run --iters)
+DEFAULT_EARLY_STOP_TOL = 1e-4     # relative loss improvement below this doesn't reset patience
 DEFAULT_TOPK = 6
 DEFAULT_TOPK_PER_VARIABLE = 5
 
@@ -562,8 +574,18 @@ def main():
                               f"{DEFAULT_CHUNK_STEPS} -- see module docstring on truncated "
                               "BPTT; must stay well inside the ~7500-8000-step gradient horizon "
                               "documented in jax_lakeModel_functions.py)")
-    parser.add_argument("--iters", type=int, default=DEFAULT_ITERS, help="Adam iterations")
+    parser.add_argument("--iters", type=int, default=DEFAULT_ITERS,
+                         help="maximum Adam iterations (may stop earlier -- see --early-stop-patience)")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR, help="log-space Adam learning rate")
+    parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE,
+                         help=f"stop the Adam loop once this many consecutive iterations fail to "
+                              f"improve the loss by more than --early-stop-tol (default "
+                              f"{DEFAULT_EARLY_STOP_PATIENCE}); 0 disables early stopping and always "
+                              f"runs the full --iters")
+    parser.add_argument("--early-stop-tol", type=float, default=DEFAULT_EARLY_STOP_TOL,
+                         help=f"relative loss improvement (over the best loss so far) below which an "
+                              f"iteration counts as non-improving for --early-stop-patience (default "
+                              f"{DEFAULT_EARLY_STOP_TOL})")
     parser.add_argument("--topk", type=int, default=DEFAULT_TOPK,
                          help="number of parameters to calibrate from the COMBINED ranking "
                               "(only used with --select-mode combined)")
@@ -794,10 +816,15 @@ def main():
     opt = optax.adam(args.lr)
     opt_state = opt.init(theta_log)
 
-    print(f"\nRunning {args.iters} Adam iterations ({n_steps} steps/iteration across {n_chunks} "
-          "gradient-truncated chunk(s), jitted -- first iteration includes compile time)...")
+    early_stop_msg = (
+        f"early-stopping after {args.early_stop_patience} stalled iteration(s) "
+        f"(tol={args.early_stop_tol:.4g})" if args.early_stop_patience > 0 else "early-stopping disabled"
+    )
+    print(f"\nRunning up to {args.iters} Adam iterations ({n_steps} steps/iteration across {n_chunks} "
+          f"gradient-truncated chunk(s), jitted -- first iteration includes compile time; {early_stop_msg})...")
     best_loss, best_theta_log = float(val0), dict(theta_log0)
     history = [float(val0)]
+    stall_count = 0  # consecutive iterations with no "significant" improvement -- see --early-stop-patience
     for it in range(args.iters):
         t0 = time.time()
         loss_val, grads = grad_fn(theta_log)
@@ -814,9 +841,24 @@ def main():
         t1 = time.time()
         loss_f = float(loss_val)
         history.append(loss_f)
+        # Relative to the best loss seen *before* this iteration -- matches
+        # the sense of "has progress stalled", not just "did this exact
+        # step improve on the previous one" (which would be noisy with Adam).
+        improved_enough = (best_loss - loss_f) > args.early_stop_tol * max(abs(best_loss), 1e-12)
         if loss_f < best_loss:
             best_loss, best_theta_log = loss_f, dict(theta_log)
         print(f"  iter {it:3d}: loss={loss_f:.6g}  ({t1 - t0:.1f}s)")
+        if args.early_stop_patience > 0:
+            if improved_enough:
+                stall_count = 0
+            else:
+                stall_count += 1
+                if stall_count >= args.early_stop_patience:
+                    print(f"  iter {it}: loss hasn't improved by more than "
+                          f"{args.early_stop_tol:.4g} (relative) for "
+                          f"{args.early_stop_patience} consecutive iteration(s) -- stopping "
+                          "early. Keeping the best result found so far.")
+                    break
 
     print(f"\nBest loss: {best_loss:.6g}  (baseline was {float(val0):.6g}, "
           f"{100 * (1 - best_loss / float(val0)):.1f}% reduction)")
