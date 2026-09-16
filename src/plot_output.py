@@ -5,6 +5,7 @@ import pickle
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.colors import Normalize
 
 
 def to_numpy(arr):
@@ -80,7 +81,7 @@ def _apply_orientation(data, time_values, depth_values):
     return arr, time_values, depth_values
 
 
-def _build_time_labels(time_values):
+def _build_time_labels(time_values, start_time=None):
     if time_values is None:
         return None, None
 
@@ -89,7 +90,10 @@ def _build_time_labels(time_values):
         return None, None
 
     try:
-        labels = pd.to_datetime(values)
+        if start_time is not None and np.issubdtype(values.dtype, np.number):
+            labels = start_time + pd.to_timedelta(values, unit="s")
+        else:
+            labels = pd.to_datetime(values)
         tick_idx = np.linspace(0, len(labels) - 1, min(10, len(labels)), dtype=int)
         tick_labels = [lbl.strftime("%Y-%m-%d") for lbl in labels[tick_idx]]
         return tick_idx, tick_labels
@@ -119,6 +123,44 @@ def _load_temperature_observations(result_path, observations_path=None):
     return observations.dropna(subset=["datetime", "Depth_meter", "Water_Temperature_celsius"])
 
 
+def _load_water_quality_observations(result_path, observations_path=None):
+    if observations_path is None:
+        result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
+        observations_path = os.path.join(result_dir, "L0001-WQ.csv")
+
+    if not os.path.exists(observations_path):
+        return {}
+
+    observations = pd.read_csv(observations_path)
+    required = {"datetime", "depth", "observation", "variable"}
+    missing = required.difference(observations.columns)
+    if missing:
+        raise ValueError(
+            f"Water-quality observations are missing required columns: {sorted(missing)}"
+        )
+
+    observations["datetime"] = pd.to_datetime(observations["datetime"])
+    observations = observations.dropna(subset=["datetime", "depth", "observation"])
+    return {
+        variable: observations[observations["variable"] == variable].rename(
+            columns={"depth": "Depth_meter", "observation": "value"}
+        )
+        for variable in ("do", "doc")
+    }
+
+
+def _load_model_volume(result_path, n_depth):
+    result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
+    volume_path = os.path.join(result_dir, "volume.csv")
+    if not os.path.exists(volume_path):
+        return None
+
+    volume = np.loadtxt(volume_path, delimiter=",")
+    if volume.ndim == 1 and volume.size == n_depth:
+        return volume
+    return None
+
+
 def _load_start_time(result_path):
     result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
     run_config_path = os.path.join(result_dir, "run_config.csv")
@@ -131,57 +173,207 @@ def _load_start_time(result_path):
     return pd.to_datetime(run_config.loc["start_time"].iloc[0])
 
 
-def _plot_temperature_profiles(
-    temp, time_values, depth_values, observations, start_time=None
+def _model_datetimes(time_values, start_time):
+    if time_values is None:
+        return None
+
+    values = to_numpy(time_values)
+    if start_time is not None and np.issubdtype(values.dtype, np.number):
+        return start_time + pd.to_timedelta(values, unit="s")
+    if np.issubdtype(values.dtype, np.datetime64):
+        return pd.to_datetime(values)
+    return None
+
+
+def _select_temperature_depths(observations):
+    observed_depths = np.sort(observations["Depth_meter"].unique())
+    shallowest_depth = observed_depths[0]
+    upper_observations = observations[observations["Depth_meter"] == shallowest_depth]
+    upper_years = set(upper_observations["datetime"].dt.year)
+
+    eligible_lower_depths = [
+        depth
+        for depth in observed_depths[1:]
+        if upper_years.issubset(
+            set(
+                observations[observations["Depth_meter"] == depth]
+                .groupby(observations["datetime"].dt.year)
+                .size()
+                .loc[lambda counts: counts >= 2]
+                .index
+            )
+        )
+    ]
+    if not eligible_lower_depths:
+        return None
+    return shallowest_depth, eligible_lower_depths[-1]
+
+
+def _filter_to_modeled_period(observations, time_values, start_time):
+    model_datetimes = _model_datetimes(time_values, start_time)
+    if model_datetimes is None:
+        return observations, model_datetimes
+
+    return (
+        observations[
+            observations["datetime"].between(model_datetimes[0], model_datetimes[-1])
+        ],
+        model_datetimes,
+    )
+
+
+def _plot_observed_series(
+    model_data,
+    time_values,
+    depth_values,
+    observations,
+    value_column,
+    title,
+    y_label,
+    start_time=None,
+    figure_title=None,
 ):
     if observations is None or observations.empty:
         return None
-    if depth_values is None or depth_values.ndim != 1 or depth_values.size != temp.shape[1]:
+    if depth_values is None or depth_values.ndim != 1 or depth_values.size != model_data.shape[1]:
         return None
 
-    observed_depths = np.sort(observations["Depth_meter"].unique())
-    shallowest_depth = observed_depths[0]
-    deepest_depth = observed_depths[-1]
-    selected_depths = [shallowest_depth, deepest_depth]
+    observations, model_datetimes = _filter_to_modeled_period(
+        observations, time_values, start_time
+    )
+    if observations.empty:
+        return None
+
+    selected_depths = _select_temperature_depths(observations)
+    if selected_depths is None:
+        return None
+    shallowest_depth, deepest_depth = selected_depths
     model_indices = [int(np.abs(depth_values - depth).argmin()) for depth in selected_depths]
 
-    if start_time is not None and time_values is not None:
-        model_times = start_time + pd.to_timedelta(time_values, unit="s")
+    if model_datetimes is not None:
+        model_times = model_datetimes
         x_label = "Date"
     else:
-        model_times = np.arange(temp.shape[0])
+        model_times = np.arange(model_data.shape[0])
         x_label = "Time step"
 
-    fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
+    fig = plt.figure(figsize=(16, 9), constrained_layout=True)
+    layout = fig.add_gridspec(2, 2, width_ratios=(1.6, 1.0), wspace=0.28)
+    axes = [fig.add_subplot(layout[row, 0]) for row in range(2)]
+    scatter_axis = fig.add_subplot(layout[:, 1])
     for axis, observed_depth, model_index in zip(axes, selected_depths, model_indices):
         observed = observations[observations["Depth_meter"] == observed_depth]
         axis.plot(
             model_times,
-            temp[:, model_index],
+            model_data[:, model_index],
             label=f"Model ({depth_values[model_index]:g} m)",
         )
         axis.scatter(
             observed["datetime"],
-            observed["Water_Temperature_celsius"],
+            observed[value_column],
             label=f"Observed ({observed_depth:g} m)",
             color="black",
             s=18,
             zorder=3,
         )
-        axis.set_title(f"Temperature at {observed_depth:g} m observed depth")
-        axis.set_ylabel("Temperature (deg C)")
+        axis.set_title(f"{title} at {observed_depth:g} m observed depth")
+        axis.set_ylabel(y_label)
         axis.grid(True, alpha=0.3)
         axis.legend()
 
+    scatter = None
+    scatter_values = []
+    if model_datetimes is not None:
+        scatter_depths = observations["Depth_meter"].to_numpy(dtype=float)
+        scatter_model_indices = np.abs(
+            depth_values[:, None] - scatter_depths[None, :]
+        ).argmin(axis=0)
+        observed_times = pd.DatetimeIndex(observations["datetime"])
+        right_idx = np.searchsorted(model_datetimes, observed_times)
+        right_idx = np.clip(right_idx, 0, len(model_datetimes) - 1)
+        left_idx = np.maximum(right_idx - 1, 0)
+        right_distance = np.abs(model_datetimes[right_idx] - observed_times)
+        left_distance = np.abs(model_datetimes[left_idx] - observed_times)
+        nearest_idx = np.where(right_distance < left_distance, right_idx, left_idx)
+        observed_values = observations[value_column].to_numpy(dtype=float)
+        modeled_values = model_data[nearest_idx, scatter_model_indices]
+        depth_min = scatter_depths.min()
+        depth_max = scatter_depths.max()
+        depth_norm = Normalize(
+            vmin=depth_min if depth_min != depth_max else depth_min - 0.5,
+            vmax=depth_max if depth_min != depth_max else depth_max + 0.5,
+        )
+        scatter = scatter_axis.scatter(
+            observed_values,
+            modeled_values,
+            c=scatter_depths,
+            cmap="viridis",
+            norm=depth_norm,
+            s=24,
+            alpha=0.75,
+        )
+        scatter_values.extend((observed_values, modeled_values))
+        fig.colorbar(scatter, ax=scatter_axis, label="Observed depth (m)")
+
     axes[-1].set_xlabel(x_label)
+    has_scatter = bool(scatter_values)
+    if has_scatter:
+        scatter_values = np.concatenate(scatter_values)
+        finite = np.isfinite(scatter_values)
+        if finite.any():
+            value_min = scatter_values[finite].min()
+            value_max = scatter_values[finite].max()
+            padding = max((value_max - value_min) * 0.05, 1e-12)
+            line_min = value_min - padding
+            line_max = value_max + padding
+            scatter_axis.plot(
+                [line_min, line_max],
+                [line_min, line_max],
+                color="black",
+                linestyle="--",
+                label="1:1",
+            )
+            scatter_axis.set_xlim(line_min, line_max)
+            scatter_axis.set_ylim(line_min, line_max)
+    scatter_axis.set_title(f"{title}: modeled vs observed")
+    scatter_axis.set_xlabel("Observed")
+    scatter_axis.set_ylabel("Modeled")
+    scatter_axis.grid(True, alpha=0.3)
+    scatter_axis.set_aspect("equal", adjustable="box")
+    if has_scatter:
+        scatter_axis.legend([scatter_axis.lines[-1]], ["1:1"])
+    if figure_title is None and title == "Temperature":
+        figure_title = (
+            f"Observed depths during modeled period: upper {shallowest_depth:g} m, "
+            f"lower {deepest_depth:g} m"
+        )
+    elif figure_title is None:
+        figure_title = (
+            f"{title}: observed depths during modeled period: upper {shallowest_depth:g} m, "
+            f"lower {deepest_depth:g} m"
+        )
+    fig.suptitle(figure_title)
     fig.autofmt_xdate()
-    fig.tight_layout()
     return fig
 
 
-def _prepare_plot_arrays(res, time_values, depth_values, n_depth):
+def _plot_temperature_profiles(
+    temp, time_values, depth_values, observations, start_time=None
+):
+    return _plot_observed_series(
+        temp,
+        time_values,
+        depth_values,
+        observations,
+        "Water_Temperature_celsius",
+        "Temperature",
+        "Temperature (deg C)",
+        start_time,
+    )
+
+
+def _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume=None):
     arrays = {}
-    volume = None
     if "volume" in res:
         volume = to_numpy(res["volume"])
 
@@ -200,7 +392,7 @@ def _prepare_plot_arrays(res, time_values, depth_values, n_depth):
     return arrays
 
 
-def plot_result(path, observations_path=None):
+def plot_result(path, observations_path=None, water_quality_observations_path=None):
     res = load_result(path)
     if not isinstance(res, dict):
         raise TypeError(f"Expected a dictionary-like result, got {type(res).__name__}")
@@ -223,10 +415,12 @@ def plot_result(path, observations_path=None):
 
     temp, time_values, depth_values = _apply_orientation(temp, time_values, depth_values)
     n_time, n_depth = temp.shape
+    start_time = _load_start_time(path)
+    volume = to_numpy(res["volume"]) if "volume" in res else _load_model_volume(path, n_depth)
 
-    arrays = _prepare_plot_arrays(res, time_values, depth_values, n_depth)
+    arrays = _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume)
 
-    x_ticks, x_labels = _build_time_labels(time_values)
+    x_ticks, x_labels = _build_time_labels(time_values, start_time)
     y_values = depth_values if depth_values is not None and depth_values.ndim == 1 and depth_values.size == n_depth else None
 
     fig, axes = plt.subplots(3, 3, figsize=(18, 15))
@@ -272,8 +466,37 @@ def plot_result(path, observations_path=None):
 
     plt.tight_layout()
     observations = _load_temperature_observations(path, observations_path)
-    start_time = _load_start_time(path)
     _plot_temperature_profiles(temp, time_values, depth_values, observations, start_time)
+
+    water_quality_observations = _load_water_quality_observations(
+        path, water_quality_observations_path
+    )
+    if volume is not None and volume.size == n_depth:
+        o2 = arrays.get("o2")
+        docr = arrays.get("docr")
+        docl = arrays.get("docl")
+        if o2 is not None:
+            _plot_observed_series(
+                o2,
+                time_values,
+                depth_values,
+                water_quality_observations.get("do"),
+                "value",
+                "Dissolved oxygen",
+                "O2 (mg/L)",
+                start_time,
+            )
+        if docr is not None and docl is not None:
+            _plot_observed_series(
+                docr + docl,
+                time_values,
+                depth_values,
+                water_quality_observations.get("doc"),
+                "value",
+                "Dissolved organic carbon",
+                "DOC (mg/L)",
+                start_time,
+            )
     plt.show()
 
 
@@ -284,8 +507,12 @@ def main():
         "--observations",
         help="Optional path to L0001-HD.csv; by default it is looked up beside the result.",
     )
+    parser.add_argument(
+        "--water-quality-observations",
+        help="Optional path to L0001-WQ.csv; by default it is looked up beside the result.",
+    )
     args = parser.parse_args()
-    plot_result(args.path, args.observations)
+    plot_result(args.path, args.observations, args.water_quality_observations)
 
 
 if __name__ == "__main__":

@@ -542,9 +542,9 @@ def provide_carbon(ocloadfile, startingDate, startTime):
         daily_oc = pd.concat([pd.DataFrame([first_row]), daily_oc], ignore_index=True)
 
     # Compute time offset from simulation start
-    print("Unique datetimes in daily_oc:")
-    print(daily_oc['date'].unique())
-    print("Shape:", daily_oc.shape)
+    #print("Unique datetimes in daily_oc:")
+    #print(daily_oc['date'].unique())
+    #print("Shape:", daily_oc.shape)
     #daily_oc['dt'] = (daily_oc['date'] - daily_oc['date'].iloc[0]).dt.total_seconds() + startTime
     # time_diff = daily_oc['date'] - daily_oc['date'].iloc[0]
     # daily_oc['dt'] = time_diff.dt.total_seconds() + startTime

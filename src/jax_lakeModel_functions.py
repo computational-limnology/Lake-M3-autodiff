@@ -1144,8 +1144,10 @@ def full_step(state, forcing, geometry, params):
         + params["light_poc"] * jnp.sum(sum_poc) / n_mask
     )
 
-    # 2. OC river loading
-    perdepth_oc = forcing["carbon"] * geometry["hypso_weight"]
+    # 2. OC river loading (`oc_load_factor` scales the measured "oc"
+    # concentration in oc_load_file.csv -- see default_params() -- treating
+    # the overall carbon-loading boundary condition as a calibratable unknown)
+    perdepth_oc = forcing["carbon"] * params["oc_load_factor"] * geometry["hypso_weight"]
     docr = docr + perdepth_oc * params["prop_oc_docr"]
     docl = docl + perdepth_oc * params["prop_oc_docl"]
     pocr = pocr + perdepth_oc * params["prop_oc_pocr"]
@@ -1345,6 +1347,19 @@ def default_params(model_params: dict, ice_and_snow: dict = None) -> dict:
         prop_oc_docl=float(model_params["prop_oc_docl"]),
         prop_oc_pocr=float(model_params["prop_oc_pocr"]),
         prop_oc_pocl=float(model_params["prop_oc_pocl"]),
+        # Multiplier on the OC loading forcing (`forcing["carbon"]`, built from
+        # oc_load_file.csv's "oc" concentration column times "discharge" --
+        # see `provide_carbon()`). Scaling `oc` itself before that product is
+        # computed would give exactly the same result (multiplication is
+        # linear/commutative here), so applying it to the forcing in
+        # `full_step` instead is equivalent without needing to touch
+        # `provide_carbon`/`oc_load_file.csv` parsing at all. Not a column
+        # the original numpy `run_wq_model` reads -- JAX/calibration-only,
+        # default 1.0 (no change from the measured concentration), added so
+        # the overall scale of the carbon loading -- often one of the more
+        # uncertain boundary conditions -- can be treated as an unknown and
+        # calibrated like any other parameter.
+        oc_load_factor=float(model_params.get("oc_load_factor", 1.0)),
         settling_rate_labile=float(model_params["settling_rate_labile"]) / 86400,
         settling_rate_refractory=float(model_params["settling_rate_refractory"]) / 86400,
         f_sod=float(model_params["f_sod"]),

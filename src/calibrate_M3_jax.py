@@ -209,6 +209,10 @@ DEFAULT_TOPK_PER_VARIABLE = 5
 # fractions prop_oc_docr/docl/pocr/pocl (must sum sensibly across pools,
 # not safe to move independently), and beta (not a model_params.csv column
 # at all -- run_wq_model never lets the caller override it either).
+# "oc_load_factor" is a JAX-only addition (see default_params()/full_step()
+# in jax_lakeModel_functions.py): a multiplier on oc_load_file.csv's "oc"
+# concentration column, treating the overall scale of the carbon-loading
+# boundary condition as an unknown to calibrate rather than a fixed input.
 CANDIDATE_PARAMS = [
     "km", "weight_kz", "Cd", "denThresh",
     "kd_light", "light_water", "light_doc", "light_poc",
@@ -217,6 +221,7 @@ CANDIDATE_PARAMS = [
     "resp_docr", "resp_docl", "resp_pocr", "resp_pocl",
     "settling_rate_labile", "settling_rate_refractory",
     "f_sod", "d_thick", "meltP", "p2", "eps", "emissivity",
+    "oc_load_factor",
 ]
 
 
