@@ -39,6 +39,18 @@ assumption for calibration targets, so we simply don't score those
 points). Each profile date is mapped to the nearest simulation step via
 `round((obs_datetime - start_date).total_seconds() / dt)`.
 
+Buoy temperature data (`ravn_2023.json`/`ravn_2024.json`, plus
+`sensor_level_buoy.sen` for the sensor->depth mapping), if present in the
+data directory, is folded into the temperature observations the same way
+(see `load_buoy_temperature()`): it is a fixed-depth thermistor chain (18
+sensors) natively sampled roughly every 15 minutes, averaged down to
+hourly bins, reshaped to the same long-format schema as `L0001-HD.csv`,
+and treated as one additional "profile" per hourly timestamp. This can
+add hundreds to thousands of extra profile dates within its coverage
+window, all scored the same way as the sparser HD profiles.
+`plot_output.py`'s `_load_temperature_observations()` merges it in
+identically for plotting.
+
 Gradient horizon and truncated backpropagation through time (TBPTT):
 `jax_lakeModel_functions.py`'s module docstring documents two genuine,
 now-fixed gradient-safety bugs found while building this feature: (1)
@@ -177,6 +189,7 @@ to `calibration_metrics.csv` alongside `calibration_result.csv` (the
 parameter table).
 """
 import argparse
+import json
 import os
 import time
 from copy import deepcopy
@@ -237,13 +250,81 @@ CANDIDATE_PARAMS = [
 ]
 
 
+def load_buoy_temperature(
+    data_dir,
+    json_files=("ravn_2023.json", "ravn_2024.json"),
+    sensor_file="sensor_level_buoy.sen",
+):
+    """Load high-frequency buoy thermistor-chain temperature data from the
+    raw JSON exports (`ravn_2023.json`/`ravn_2024.json`), if present,
+    average it down to hourly values, and reshape it to the same
+    long-format schema as `L0001-HD.csv` (`datetime`, `Depth_meter`,
+    `Water_Temperature_celsius`).
+
+    Each JSON file has the shape
+    `{"data": {"tempCableReadings": {"timestamps": [...], "t1": [...],
+    ..., "t18": [...]}}}`, with `timestamps` as Unix epoch seconds (native
+    sampling is irregular, roughly every 15 minutes) and `t1..t18` the
+    temperature (degC) at each of the 18 thermistor depths (looked up from
+    `sensor_file`, whitespace-delimited with columns `sensor, position,
+    specification`, where `position` is that sensor's depth in meters).
+    Native readings are averaged into hourly bins (`resample("1h").mean()`)
+    before being reshaped to long format, since the native ~15-minute
+    cadence is finer than the model's hourly timestep. Any of `json_files`
+    that is missing is skipped; returns `None` if none are found, or if
+    `sensor_file` is missing (e.g. for datasets other than Ravn), so this
+    is a no-op unless the buoy files are actually present."""
+    sensor_path = os.path.join(data_dir, sensor_file)
+    if not os.path.exists(sensor_path):
+        return None
+    sensors = pd.read_csv(sensor_path, sep=r"\s+")
+    depth_by_sensor = dict(zip(sensors["sensor"].astype(int), sensors["position"].astype(float)))
+
+    hourly_frames = []
+    for json_file in json_files:
+        json_path = os.path.join(data_dir, json_file)
+        if not os.path.exists(json_path):
+            continue
+        with open(json_path) as f:
+            payload = json.load(f)
+        readings = payload["data"]["tempCableReadings"]
+        sensor_cols = [k for k in readings if k != "timestamps"]
+        wide = pd.DataFrame(
+            {col: readings[col] for col in sensor_cols},
+            index=pd.to_datetime(np.asarray(readings["timestamps"], dtype="int64"), unit="s"),
+        ).sort_index()
+        hourly_frames.append(wide.resample("1h").mean())
+
+    if not hourly_frames:
+        return None
+
+    hourly = pd.concat(hourly_frames).sort_index()
+    hourly = hourly[~hourly.index.duplicated(keep="first")]
+    hourly.index.name = "datetime"
+
+    long = hourly.reset_index().melt(
+        id_vars="datetime", var_name="sensor", value_name="Water_Temperature_celsius"
+    )
+    long["Depth_meter"] = long["sensor"].str[1:].astype(int).map(depth_by_sensor)
+    long = long.dropna(subset=["Depth_meter", "Water_Temperature_celsius"])
+    return long[["datetime", "Depth_meter", "Water_Temperature_celsius"]]
+
+
 def load_observations(data_dir, depth, volume, start_date, step_times, dt):
     """Load L0001-HD.csv/L0001-WQ.csv, restrict to the simulation window,
     and build per-variable dicts of (step_idx, values, mask) arrays on the
     model's depth grid. `values` are in the model's own units: degC for
     temperature, mass (obs_mgL * volume) for o2/doc. Returns a dict with
     keys "temp", "o2", "doc" (each None if no observations fall in the
-    simulation window)."""
+    simulation window).
+
+    Temperature observations additionally include the high-frequency buoy
+    thermistor-chain record (`ravn_2023.json`/`ravn_2024.json`, averaged
+    to hourly), if present, concatenated onto `L0001-HD.csv` before
+    gridding -- see `load_buoy_temperature()`. Each buoy timestamp becomes
+    its own "profile" (matching `L0001-HD.csv`'s per-datetime grouping),
+    so this can add hundreds to thousands of extra profile dates within
+    the buoy's coverage window."""
     depth = np.asarray(depth)
     volume = np.asarray(volume)
     n_steps = len(step_times)
@@ -294,6 +375,12 @@ def load_observations(data_dir, depth, volume, start_date, step_times, dt):
 
     hd = pd.read_csv(os.path.join(data_dir, "L0001-HD.csv"))
     hd["datetime"] = pd.to_datetime(hd["datetime"])
+    buoy = load_buoy_temperature(data_dir)
+    if buoy is not None:
+        hd = pd.concat(
+            [hd[["datetime", "Depth_meter", "Water_Temperature_celsius"]], buoy],
+            ignore_index=True,
+        )
     temp_obs = build(hd, "Depth_meter", "Water_Temperature_celsius", mass_convert=False)
 
     wq = pd.read_csv(os.path.join(data_dir, "L0001-WQ.csv"))

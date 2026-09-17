@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import pickle
 
@@ -103,23 +104,80 @@ def _build_time_labels(time_values, start_time=None):
         return tick_idx, tick_labels
 
 
-def _load_temperature_observations(result_path, observations_path=None):
-    if observations_path is None:
-        result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
-        observations_path = os.path.join(result_dir, "L0001-HD.csv")
+def _load_buoy_temperature_observations(
+    result_dir,
+    json_files=("ravn_2023.json", "ravn_2024.json"),
+    sensor_file="sensor_level_buoy.sen",
+):
+    """Load the high-frequency buoy thermistor-chain record from the raw
+    JSON exports (`ravn_2023.json`/`ravn_2024.json`), if present in
+    `result_dir`, average it down to hourly values, and reshape it to the
+    same long-format schema as `L0001-HD.csv`. See
+    `calibrate_M3_jax.load_buoy_temperature()` for the JSON schema and
+    resampling details (kept in sync with this copy). Returns `None` if
+    `sensor_file` or none of `json_files` are present."""
+    sensor_path = os.path.join(result_dir, sensor_file)
+    if not os.path.exists(sensor_path):
+        return None
+    sensors = pd.read_csv(sensor_path, sep=r"\s+")
+    depth_by_sensor = dict(zip(sensors["sensor"].astype(int), sensors["position"].astype(float)))
 
-    if not os.path.exists(observations_path):
+    hourly_frames = []
+    for json_file in json_files:
+        json_path = os.path.join(result_dir, json_file)
+        if not os.path.exists(json_path):
+            continue
+        with open(json_path) as f:
+            payload = json.load(f)
+        readings = payload["data"]["tempCableReadings"]
+        sensor_cols = [k for k in readings if k != "timestamps"]
+        wide = pd.DataFrame(
+            {col: readings[col] for col in sensor_cols},
+            index=pd.to_datetime(np.asarray(readings["timestamps"], dtype="int64"), unit="s"),
+        ).sort_index()
+        hourly_frames.append(wide.resample("1h").mean())
+
+    if not hourly_frames:
         return None
 
-    observations = pd.read_csv(observations_path)
-    required = {"datetime", "Depth_meter", "Water_Temperature_celsius"}
-    missing = required.difference(observations.columns)
-    if missing:
-        raise ValueError(
-            f"Temperature observations are missing required columns: {sorted(missing)}"
+    hourly = pd.concat(hourly_frames).sort_index()
+    hourly = hourly[~hourly.index.duplicated(keep="first")]
+    hourly.index.name = "datetime"
+
+    long = hourly.reset_index().melt(
+        id_vars="datetime", var_name="sensor", value_name="Water_Temperature_celsius"
+    )
+    long["Depth_meter"] = long["sensor"].str[1:].astype(int).map(depth_by_sensor)
+    long = long.dropna(subset=["Depth_meter", "Water_Temperature_celsius"])
+    return long[["datetime", "Depth_meter", "Water_Temperature_celsius"]]
+
+
+def _load_temperature_observations(result_path, observations_path=None):
+    result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
+    if observations_path is None:
+        observations_path = os.path.join(result_dir, "L0001-HD.csv")
+
+    observations = None
+    if os.path.exists(observations_path):
+        observations = pd.read_csv(observations_path)
+        required = {"datetime", "Depth_meter", "Water_Temperature_celsius"}
+        missing = required.difference(observations.columns)
+        if missing:
+            raise ValueError(
+                f"Temperature observations are missing required columns: {sorted(missing)}"
+            )
+        observations["datetime"] = pd.to_datetime(observations["datetime"])
+        observations = observations[["datetime", "Depth_meter", "Water_Temperature_celsius"]]
+
+    buoy = _load_buoy_temperature_observations(result_dir)
+    if buoy is not None:
+        observations = buoy if observations is None else pd.concat(
+            [observations, buoy], ignore_index=True
         )
 
-    observations["datetime"] = pd.to_datetime(observations["datetime"])
+    if observations is None:
+        return None
+
     return observations.dropna(subset=["datetime", "Depth_meter", "Water_Temperature_celsius"])
 
 
@@ -185,8 +243,21 @@ def _model_datetimes(time_values, start_time):
     return None
 
 
-def _select_temperature_depths(observations):
+def _select_temperature_depths(observations, depths=None):
+    """Pick the (upper, lower) observed depths used for the time-series
+    panels. By default, auto-selects the shallowest observed depth and the
+    deepest depth that has data in every year the shallowest depth does.
+    If `depths` is given (a 2-tuple/list of (upper, lower) depths in
+    meters, e.g. from `--depths 1,30`), each requested value is instead
+    snapped to the nearest depth actually present in `observations`."""
     observed_depths = np.sort(observations["Depth_meter"].unique())
+
+    if depths is not None:
+        upper_requested, lower_requested = depths
+        upper_depth = float(observed_depths[np.abs(observed_depths - upper_requested).argmin()])
+        lower_depth = float(observed_depths[np.abs(observed_depths - lower_requested).argmin()])
+        return upper_depth, lower_depth
+
     shallowest_depth = observed_depths[0]
     upper_observations = observations[observations["Depth_meter"] == shallowest_depth]
     upper_years = set(upper_observations["datetime"].dt.year)
@@ -232,6 +303,7 @@ def _plot_observed_series(
     y_label,
     start_time=None,
     figure_title=None,
+    depths=None,
 ):
     if observations is None or observations.empty:
         return None
@@ -244,7 +316,7 @@ def _plot_observed_series(
     if observations.empty:
         return None
 
-    selected_depths = _select_temperature_depths(observations)
+    selected_depths = _select_temperature_depths(observations, depths)
     if selected_depths is None:
         return None
     shallowest_depth, deepest_depth = selected_depths
@@ -358,7 +430,7 @@ def _plot_observed_series(
 
 
 def _plot_temperature_profiles(
-    temp, time_values, depth_values, observations, start_time=None
+    temp, time_values, depth_values, observations, start_time=None, depths=None
 ):
     return _plot_observed_series(
         temp,
@@ -369,6 +441,7 @@ def _plot_temperature_profiles(
         "Temperature",
         "Temperature (deg C)",
         start_time,
+        depths=depths,
     )
 
 
@@ -392,7 +465,7 @@ def _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume=None):
     return arrays
 
 
-def plot_result(path, observations_path=None, water_quality_observations_path=None):
+def plot_result(path, observations_path=None, water_quality_observations_path=None, depths=None):
     res = load_result(path)
     if not isinstance(res, dict):
         raise TypeError(f"Expected a dictionary-like result, got {type(res).__name__}")
@@ -466,7 +539,7 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
 
     plt.tight_layout()
     observations = _load_temperature_observations(path, observations_path)
-    _plot_temperature_profiles(temp, time_values, depth_values, observations, start_time)
+    _plot_temperature_profiles(temp, time_values, depth_values, observations, start_time, depths=depths)
 
     water_quality_observations = _load_water_quality_observations(
         path, water_quality_observations_path
@@ -485,6 +558,7 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
                 "Dissolved oxygen",
                 "O2 (mg/L)",
                 start_time,
+                depths=depths,
             )
         if docr is not None and docl is not None:
             _plot_observed_series(
@@ -496,6 +570,7 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
                 "Dissolved organic carbon",
                 "DOC (mg/L)",
                 start_time,
+                depths=depths,
             )
     plt.show()
 
@@ -511,8 +586,27 @@ def main():
         "--water-quality-observations",
         help="Optional path to L0001-WQ.csv; by default it is looked up beside the result.",
     )
+    parser.add_argument(
+        "--depths",
+        help="Comma-separated upper,lower observed depths (meters) to use for the "
+        "temperature/O2/DOC time-series panels, e.g. '--depths 1,30'. Each value is "
+        "snapped to the nearest depth actually present in the observations. If "
+        "omitted, depths are auto-selected as before (shallowest observed depth, "
+        "and the deepest depth with data covering the same years).",
+    )
     args = parser.parse_args()
-    plot_result(args.path, args.observations, args.water_quality_observations)
+
+    depths = None
+    if args.depths is not None:
+        parts = [p.strip() for p in args.depths.split(",")]
+        if len(parts) != 2:
+            parser.error("--depths expects exactly two comma-separated values, e.g. '1,30'")
+        try:
+            depths = (float(parts[0]), float(parts[1]))
+        except ValueError:
+            parser.error(f"--depths values must be numeric, got '{args.depths}'")
+
+    plot_result(args.path, args.observations, args.water_quality_observations, depths=depths)
 
 
 if __name__ == "__main__":
