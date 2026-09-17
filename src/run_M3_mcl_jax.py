@@ -10,40 +10,61 @@ recurrent network, trained against the buoy/HD temperature record, learn a
 and does it actually improve the temperature fit on data it wasn't trained
 on?
 
-Design (see the feasibility discussion this script followed from):
+Design (see the feasibility discussion this script followed from, and the
+diagnostic follow-up that motivated the depth-basis/stratification-feature
+revision below -- an initial uniform-plus-linear-in-depth version fixed the
+deep-water bias nicely (test RMSE at >=20m dropped ~44%) but barely moved
+the surface (~9%), and the per-snapshot kz profiles showed mismatches with
+a kink near the thermocline that a 2-coefficient linear-in-depth form
+cannot represent, being monotonic in depth by construction):
 
   * Hybrid/residual, not a full replacement. Every step, the process-based
     `kz_process` is still computed exactly as before (via `full_step`'s
     `kz_override` hook -- see its docstring), and the network only supplies
-    a *multiplicative* correction:
+    a *multiplicative* correction, now a degree-`--depth-basis-degree`
+    (default 3) polynomial in depth rather than a straight line:
 
-        kz_final(depth) = kz_process(depth) * exp(a + b * depth_norm)
+        kz_final(depth) = kz_process(depth) * exp(c_0 + c_1*z + c_2*z^2 + ... )
 
-    with `depth_norm = depth / max(depth)` and `(a, b)` the two numbers a
-    small LSTM emits each step. This is deliberately low-dimensional (2
-    numbers/step, not a raw `nx`-length output) -- kz is never directly
+    with `z = depth_norm = depth / max(depth)` and `(c_0, c_1, ...)` the
+    `--depth-basis-degree + 1` numbers a small LSTM emits each step. This
+    is still deliberately low-dimensional (4 numbers/step at the default
+    degree 3, not a raw `nx`-length output) -- kz is never directly
     observed, only temperature is, so an unconstrained high-capacity
     network would be free to absorb *any* other model error into kz
-    without anything in the loss telling it not to. A uniform-plus-linear-
-    in-depth log correction is expressive enough to shift the balance
-    between surface and deep mixing, while staying identifiable and easy
-    to sanity-check (`kz_final / kz_process` is exactly `exp(a + b*z)`,
-    printed/plotted alongside the two series below).
+    without anything in the loss telling it not to. A cubic-in-depth log
+    correction can represent a non-monotonic (e.g. thermocline-centered)
+    adjustment that the original linear form could not, while `--kz-reg`
+    (a small L2 penalty on the network's weights, default
+    `DEFAULT_KZ_REG`) keeps the added degrees of freedom from chasing
+    noise where observations are sparse. Set `--depth-basis-degree 1` to
+    recover the original straight-line-in-depth behavior.
 
   * The network's final Dense layer is zero-initialized (both kernel and
-    bias), so at initialization `a = b = 0` and the hybrid model is
-    *exactly* the process-based model (`correction == 1` everywhere). Any
-    deviation is then attributable to training, not initialization noise.
+    bias), so at initialization every `c_k = 0` and the hybrid model is
+    *exactly* the process-based model (`correction == 1` everywhere,
+    regardless of the basis degree). Any deviation is then attributable to
+    training, not initialization noise.
 
   * Per-step network inputs: the 9 meteorological forcing series
     (Tair/CC/ea/Jsw/Jlw/Uw/Pa/RH/PP), z-scored using TRAIN-window mean/std
-    (computed once, not data-snooped from the test window), plus 3
-    dynamic features taken from the *incoming* state at the start of the
-    step (not this step's post-heating/ice values, to avoid a circular
-    dependency on this step's own `kz_process`): the ice flag, surface and
-    bottom temperature (`state.u[0]`, `state.u[-1]`, scaled by 1/10), and
+    (computed once, not data-snooped from the test window), plus 7 dynamic
+    features taken from the *incoming* state at the start of the step (not
+    this step's post-heating/ice values, to avoid a circular dependency on
+    this step's own `kz_process`): the ice flag, surface and bottom
+    temperature (`state.u[0]`, `state.u[-1]`, scaled by 1/10),
     `log10(mean(state.kz))` (the *previous* step's diffusivity -- mirrors
-    the process-based closure's own `kzn_prev` memory term).
+    the process-based closure's own `kzn_prev` memory term), and 3
+    stratification features computed from `calc_dens(state.u)`: the bulk
+    and peak magnitude of `|d(density)/d(depth)|` (log-scaled) and the
+    normalized depth at which that gradient peaks (the current thermocline
+    location). These three mirror the exact `buoy`/`diff_rho` quantity
+    `eddy_diffusivity_hendersonSellers` itself computes internally (see
+    that function) -- handing the network the same physical signal the
+    process-based closure's own mixing decision is based on, rather than
+    making it infer stratification indirectly from raw temperatures, and
+    giving the (now depth-resolved) correction a direct cue for *where*
+    the thermocline currently sits.
 
   * Only the network's weights are trained; every physical parameter stays
     fixed at whatever is already in `model_params.csv`. This keeps the
@@ -81,7 +102,8 @@ script's calibration runs.
 
 Usage:
     python src/run_M3_mcl_jax.py Ravn [--steps N] [--chunk-steps N]
-        [--hidden-size H] [--iters K] [--lr LR]
+        [--hidden-size H] [--depth-basis-degree D] [--kz-reg LAMBDA]
+        [--iters K] [--lr LR]
         [--train-start DATE --train-end DATE --test-start DATE --test-end DATE]
         [--out result.npz] [--nn-params-out nn_params.pkl]
 """
@@ -107,7 +129,7 @@ from processBased_lakeModel_functions import (
     get_ice_and_snow,
 )
 from jax_lakeModel_functions import (
-    default_params, default_geometry_wq, make_initial_state_full, full_step,
+    default_params, default_geometry_wq, make_initial_state_full, full_step, calc_dens,
 )
 from run_M3_jax import build_forcing_series, add_wq_forcing_series
 from calibrate_M3_jax import (
@@ -119,6 +141,8 @@ from calibrate_M3_jax import (
 DEFAULT_HIDDEN_SIZE = 16
 DEFAULT_ITERS = 40
 DEFAULT_LR = 1e-2
+DEFAULT_DEPTH_BASIS_DEGREE = 3   # polynomial-in-depth degree for the log-correction (1 = old linear form)
+DEFAULT_KZ_REG = 1e-4            # L2 penalty on the NN's weights (0 disables)
 DEFAULT_TRAIN_START = "2023-01-01"
 DEFAULT_TRAIN_END = "2023-12-31"
 DEFAULT_TEST_START = "2024-01-01"
@@ -126,26 +150,29 @@ DEFAULT_TEST_END = "2024-12-31"
 
 # Meteorological forcing series used as (z-scored) NN inputs every step.
 FORCING_FEATURE_KEYS = ["Tair", "CC", "ea", "Jsw", "Jlw", "Uw", "Pa", "RH", "PP"]
-N_DYNAMIC_FEATURES = 4  # ice flag, surface temp/10, bottom temp/10, log10(mean(prev kz))/10
+# ice flag, surface temp/10, bottom temp/10, log10(mean(prev kz))/10,
+# bulk/peak log10(density gradient), thermocline depth_norm location
+N_DYNAMIC_FEATURES = 7
 N_FEATURES = len(FORCING_FEATURE_KEYS) + N_DYNAMIC_FEATURES
 
 
 # ---------------------------------------------------------------------------
 # The correction network: a single LSTM cell + a zero-initialized linear head
-# producing the 2 log-linear-in-depth correction coefficients (a, b).
+# producing the `depth_basis_degree + 1` coefficients of a polynomial-in-
+# depth log correction (degree 1 = the original uniform-plus-linear form).
 # ---------------------------------------------------------------------------
 
-def make_modules(hidden_size):
+def make_modules(hidden_size, depth_basis_degree):
     lstm = nn.OptimizedLSTMCell(features=hidden_size, param_dtype=jnp.float64, dtype=jnp.float64)
     head = nn.Dense(
-        2, param_dtype=jnp.float64, dtype=jnp.float64,
+        depth_basis_degree + 1, param_dtype=jnp.float64, dtype=jnp.float64,
         kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros,
     )
     return lstm, head
 
 
-def init_nn_params(key, hidden_size):
-    lstm, head = make_modules(hidden_size)
+def init_nn_params(key, hidden_size, depth_basis_degree):
+    lstm, head = make_modules(hidden_size, depth_basis_degree)
     k_lstm, k_head = jax.random.split(key)
     carry0 = lstm.initialize_carry(k_lstm, (N_FEATURES,))
     x0 = jnp.zeros((N_FEATURES,), dtype=jnp.float64)
@@ -153,6 +180,33 @@ def init_nn_params(key, hidden_size):
     (_, _), y0 = lstm.apply(lstm_params, carry0, x0)
     head_params = head.init(k_head, y0)
     return dict(lstm=lstm_params, head=head_params)
+
+
+def build_depth_basis(depth, depth_basis_degree):
+    """`(degree+1, nx)` array of `depth_norm**k` for `k in 0..degree`, so the
+    correction coefficients combine via a single `jnp.dot`."""
+    depth_norm = depth / jnp.max(depth)
+    return jnp.stack([depth_norm ** k for k in range(depth_basis_degree + 1)], axis=0)
+
+
+def compute_density_gradient_features(u, depth, g):
+    """Stratification cue for the NN: bulk and peak magnitude of
+    `|d(density)/d(depth)|` (log10-scaled) and the normalized depth at
+    which it peaks (current thermocline location). Deliberately computed
+    the same way `eddy_diffusivity_hendersonSellers`'s own `buoy`/
+    `diff_rho` term is (see that function) -- this hands the network the
+    same physical signal the process-based closure's mixing decision is
+    based on, rather than making it infer stratification indirectly from
+    raw surface/bottom temperatures."""
+    dens = calc_dens(u)
+    rho_0 = jnp.mean(dens)
+    diff_rho = jnp.abs(dens[1:] - dens[:-1]) / (depth[1:] - depth[:-1]) * g / rho_0
+    diff_rho = jnp.concatenate([diff_rho, diff_rho[-1:]])  # length nx, same padding as the closure itself
+    bulk = jnp.log10(jnp.mean(diff_rho) + 1e-12) / 10.0
+    peak = jnp.log10(jnp.max(diff_rho) + 1e-12) / 10.0
+    depth_norm = depth / jnp.max(depth)
+    thermocline_loc = depth_norm[jnp.argmax(diff_rho)]
+    return jnp.array([bulk, peak, thermocline_loc])
 
 
 def build_forcing_features(forcing, train_lo, train_hi):
@@ -198,14 +252,14 @@ def simulate_baseline(phys_params, geometry, forcing, ice_state, init_state):
 # ---------------------------------------------------------------------------
 
 def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_state,
-                     chunk_steps, hidden_size, forcing_features):
-    lstm, head = make_modules(hidden_size)
+                     chunk_steps, hidden_size, depth_basis_degree, forcing_features):
+    lstm, head = make_modules(hidden_size, depth_basis_degree)
 
     u0, o2_0, docr_0, docl_0, pocr_0, pocl_0 = init_state
     nx = u0.shape[0]
     state0 = make_initial_state_full(u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, nx, **ice_state)
     depth = geometry["depth"]
-    depth_norm = depth / jnp.max(depth)
+    depth_powers = build_depth_basis(depth, depth_basis_degree)
 
     forcing_with_features = dict(forcing)
     forcing_with_features["_nn_static"] = forcing_features
@@ -235,17 +289,21 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
         state, h, c = carry
 
         ice_flag = jnp.where(state.ice, 1.0, 0.0)
-        dyn_feat = jnp.array([
-            ice_flag,
-            state.u[0] / 10.0,
-            state.u[-1] / 10.0,
-            jnp.log10(jnp.mean(state.kz) + 1e-12) / 10.0,
+        strat_feat = compute_density_gradient_features(state.u, depth, phys_params["g"])
+        dyn_feat = jnp.concatenate([
+            jnp.array([
+                ice_flag,
+                state.u[0] / 10.0,
+                state.u[-1] / 10.0,
+                jnp.log10(jnp.mean(state.kz) + 1e-12) / 10.0,
+            ]),
+            strat_feat,
         ])
         features = jnp.concatenate([forcing_t["_nn_static"], dyn_feat])
 
         (h, c), y = lstm.apply(nn_params["lstm"], (h, c), features)
         coefs = head.apply(nn_params["head"], y)
-        correction = jnp.exp(coefs[0] + coefs[1] * depth_norm)
+        correction = jnp.exp(jnp.dot(coefs, depth_powers))
 
         def kz_override(kz_process, u, ice, dens_u, forcing_step):
             return kz_process * correction
@@ -293,15 +351,24 @@ def split_obs_by_step_range(obs_var, lo, hi):
 
 
 def make_loss_fn(phys_params, geometry, forcing, ice_state, init_state, obs_train,
-                  chunk_steps, hidden_size, forcing_features):
+                  chunk_steps, hidden_size, depth_basis_degree, forcing_features, reg_weight=0.0):
     def loss_fn(nn_params):
         per_step = simulate_hybrid(
             nn_params, phys_params, geometry, forcing, ice_state, init_state,
-            chunk_steps, hidden_size, forcing_features,
+            chunk_steps, hidden_size, depth_basis_degree, forcing_features,
         )
         sim = per_step["u"][obs_train["step_idx"]]
         err2 = (sim - obs_train["values"]) ** 2 * obs_train["mask"]
-        return jnp.sum(err2) / jnp.maximum(jnp.sum(obs_train["mask"]), 1.0)
+        data_loss = jnp.sum(err2) / jnp.maximum(jnp.sum(obs_train["mask"]), 1.0)
+        if reg_weight > 0:
+            # Small L2 penalty on the network's own weights (not the runtime
+            # kz correction itself) -- standard weight decay, added because
+            # the expanded depth basis below has more freedom to overfit
+            # where observations are sparse than the original 2-coefficient
+            # linear form did.
+            reg = sum(jnp.sum(p ** 2) for p in jax.tree_util.tree_leaves(nn_params))
+            data_loss = data_loss + reg_weight * reg
+        return data_loss
 
     return loss_fn
 
@@ -347,6 +414,15 @@ def main():
                               "see calibrate_M3_jax.py's module docstring on truncated BPTT)")
     parser.add_argument("--hidden-size", type=int, default=DEFAULT_HIDDEN_SIZE,
                          help=f"LSTM hidden size (default {DEFAULT_HIDDEN_SIZE})")
+    parser.add_argument("--depth-basis-degree", type=int, default=DEFAULT_DEPTH_BASIS_DEGREE,
+                         help=f"degree of the polynomial-in-depth log kz correction (default "
+                              f"{DEFAULT_DEPTH_BASIS_DEGREE}; 1 = the original uniform-plus-linear "
+                              "form, higher values allow non-monotonic-in-depth corrections at the "
+                              "cost of more free parameters -- see --kz-reg)")
+    parser.add_argument("--kz-reg", type=float, default=DEFAULT_KZ_REG,
+                         help=f"L2 weight-decay penalty on the NN's own weights (default "
+                              f"{DEFAULT_KZ_REG}; 0 disables). Keeps a higher --depth-basis-degree "
+                              "from overfitting where observations are sparse.")
     parser.add_argument("--iters", type=int, default=DEFAULT_ITERS,
                          help=f"maximum Adam iterations (default {DEFAULT_ITERS}; may stop earlier)")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR, help=f"Adam learning rate (default {DEFAULT_LR})")
@@ -461,22 +537,27 @@ def main():
 
     # --- train the NN correction ---
     key = jax.random.PRNGKey(args.seed)
-    nn_params = init_nn_params(key, args.hidden_size)
+    nn_params = init_nn_params(key, args.hidden_size, args.depth_basis_degree)
 
     loss_fn = make_loss_fn(
         phys_params, geometry, forcing, ice_state, init_state, obs_train,
-        args.chunk_steps, args.hidden_size, forcing_features,
+        args.chunk_steps, args.hidden_size, args.depth_basis_degree, forcing_features,
+        reg_weight=args.kz_reg,
     )
     grad_fn = jax.jit(jax.value_and_grad(loss_fn))
 
-    print(f"\nTraining LSTM kz-correction ({args.hidden_size} hidden units) for up to {args.iters} "
+    print(f"\nTraining LSTM kz-correction ({args.hidden_size} hidden units, depth-basis degree "
+          f"{args.depth_basis_degree}, kz-reg {args.kz_reg:g}) for up to {args.iters} "
           f"Adam iterations against the {args.train_start}-{args.train_end} training window...")
     opt = optax.adam(args.lr)
     opt_state = opt.init(nn_params)
 
     val0, _ = grad_fn(nn_params)
     jax.block_until_ready(val0)
-    print(f"  iter  -1: loss={float(val0):.6g}  (untrained -- identical to baseline)")
+    reg_note = (" -- includes L2 penalty on the randomly-initialized LSTM weights, so this "
+                "isn't quite the baseline's own loss, but the temperature fit itself still is"
+                if args.kz_reg > 0 else " (untrained -- identical to baseline)")
+    print(f"  iter  -1: loss={float(val0):.6g}{reg_note}")
 
     best_loss, best_params = float(val0), deepcopy(nn_params)
     stall_count = 0
@@ -518,7 +599,7 @@ def main():
     t0 = time.time()
     hybrid_fn = jax.jit(lambda p: simulate_hybrid(
         p, phys_params, geometry, forcing, ice_state, init_state,
-        args.chunk_steps, args.hidden_size, forcing_features,
+        args.chunk_steps, args.hidden_size, args.depth_basis_degree, forcing_features,
     ))
     hybrid = hybrid_fn(nn_params)
     jax.block_until_ready(hybrid)
@@ -549,7 +630,8 @@ def main():
     with open(nn_params_path, "wb") as f:
         pickle.dump(dict(
             nn_params=jax.tree_util.tree_map(np.asarray, nn_params),
-            hidden_size=args.hidden_size, feature_stats=feature_stats,
+            hidden_size=args.hidden_size, depth_basis_degree=args.depth_basis_degree,
+            kz_reg=args.kz_reg, feature_stats=feature_stats,
             forcing_feature_keys=FORCING_FEATURE_KEYS,
         ), f)
     print(f"Saved trained NN weights to {nn_params_path}")
