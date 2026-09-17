@@ -1120,7 +1120,7 @@ def make_initial_state_full(u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, nx, ice=Fa
     return state
 
 
-def full_step(state, forcing, geometry, params):
+def full_step(state, forcing, geometry, params, kz_override=None):
     """One full timestep: temperature + O2/DOCr/DOCl/POCr/POCl, matching
     `run_wq_model`'s per-iteration order (see module docstring).
 
@@ -1128,7 +1128,21 @@ def full_step(state, forcing, geometry, params):
     (= `depth < mean_depth`, static), `outflow_frac` (static -- see
     `default_geometry_wq()`), and `altitude`.
     `forcing` extends the Phase-1 dict with `carbon` and `TP`.
-    """
+
+    `kz_override`, if given, replaces the process-based eddy diffusivity
+    (`eddy_diffusivity_hendersonSellers`'s output, still always computed
+    and reported as `kz_process` in the returned diagnostics dict) before
+    diffusion/settling. It is either a length-`nx` array used directly, or
+    a callable `kz_override(kz_process, u, ice, dens_u, forcing) -> kz`
+    called with this step's *post*-heating/ice-module temperature (`u`),
+    ice flag (`ice`), and density (`dens_u`) -- i.e. exactly the
+    intermediates `kz_process` itself was computed from, which a plain
+    array can't give a caller access to (they aren't otherwise exposed
+    before this point in the step). `run_M3_mcl_jax.py` uses the callable
+    form so its NN's per-step input features (surface/bottom temperature,
+    ice state) reflect this step's own state rather than the previous
+    step's. The default (`kz_override=None`) code path is numerically
+    identical to before this parameter was added."""
     area, depth, volume = geometry["area"], geometry["depth"], geometry["volume"]
     dx, dt = geometry["dx"], geometry["dt"]
     docr, docl, pocr, pocl, o2 = state.docr, state.docl, state.pocr, state.pocl, state.o2
@@ -1183,7 +1197,7 @@ def full_step(state, forcing, geometry, params):
 
     # 6. eddy diffusivity
     dens_u = calc_dens(u)
-    kz = eddy_diffusivity_hendersonSellers(
+    kz_process = eddy_diffusivity_hendersonSellers(
         # NOTE: the reference's `run_wq_model` calls this with a hardcoded
         # latitude (43.100948) instead of the lake's configured latitude,
         # in every diffusion_method branch (line 4572) -- reproduced here
@@ -1192,6 +1206,12 @@ def full_step(state, forcing, geometry, params):
         dens_u, depth, params["g"], jnp.mean(dens_u), ice, forcing["Uw"], geometry["latitude"], u,
         state.kz, params["Cd"], params["km"], params["weight_kz"],
     )
+    if kz_override is None:
+        kz = kz_process
+    elif callable(kz_override):
+        kz = kz_override(kz_process, u, ice, dens_u, forcing)
+    else:
+        kz = kz_override
 
     # 7. diffusion (temperature + O2 + DOCr + DOCl, as concentrations)
     o2c, docrc, doclc = o2 / volume, docr / volume, docl / volume
@@ -1239,7 +1259,7 @@ def full_step(state, forcing, geometry, params):
         u=u, kz=kz, ice=ice, Hi=Hi, Hs=Hs, Hsi=Hsi, iceT=iceT, rho_snow=rho_snow,
         o2=o2, docr=docr, docl=docl, pocr=pocr, pocl=pocl,
     )
-    diagnostics = dict(kd_light=kd_light, atm_flux=atm_flux, **diag)
+    diagnostics = dict(kd_light=kd_light, atm_flux=atm_flux, kz_process=kz_process, **diag)
     return new_state, diagnostics
 
 

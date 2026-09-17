@@ -30,5 +30,10 @@ jax==0.6.2
 jaxlib==0.6.2
 optax==0.2.8
 
+# LSTM-based eddy-diffusivity closure (run_M3_mcl_jax.py) -- pulls in
+# orbax-checkpoint/etils/tensorstore/etc. as transitive dependencies, none
+# of which are otherwise used by this project.
+flax==0.10.7
+
 # testing
 pytest
