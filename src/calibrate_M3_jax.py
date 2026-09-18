@@ -13,6 +13,14 @@ Usage:
     python src/calibrate_M3_jax.py Ravn [--steps N] [--chunk-steps N] [--iters K]
         [--lr LR] [--topk K] [--params p1,p2,...] [--variables temp,o2,doc] [--sensitivity-only]
 
+    `--params p1,p2,...` skips the sensitivity screen entirely (both the
+    combined and per-variable rankings) and calibrates exactly the named
+    parameters directly -- use this when you already know which parameters
+    you want to tune and don't want to pay for screening. Omit `--params`
+    to run the screen and auto-select as described below. `--params` together
+    with `--sensitivity-only` is a no-op (nothing left to screen for) and
+    exits immediately without calibrating.
+
 Key design choices
 -------------------
 Unit conversion (mass vs. concentration): the model's internal WQ state
@@ -146,8 +154,12 @@ whichever of temp/O2/DOC have observations in the window, their own most
 sensitive parameters are guaranteed to be included, not just whichever
 parameters happen to dominate the combined loss. `--select-mode combined`
 restores the old behavior (top `--topk`, default 6, from the combined
-ranking only). `--params` bypasses both and calibrates exactly the named
-parameters. Either way, selected parameters are optimized together with
+ranking only). `--params` bypasses both screens *entirely* -- they are not
+run at all in that case, not merely ignored -- and calibrates exactly the
+named parameters. This is the fast path for "I already know which
+parameters I want to tune": it skips the extra forward/backward passes
+the screens cost (see above) and goes straight to the Adam loop. Either
+way, selected parameters are optimized together with
 Adam (`optax`), in log-space (so a single learning rate means "N%
 relative step" for every parameter regardless of its raw scale, e.g.
 km ~ 1e-6 vs. theta_r ~ 1.2), under a box constraint keeping each
@@ -807,93 +819,111 @@ def main():
 
     loss_fn = make_loss_fn(base_params, geometry, forcing, ice_state, init_state, obs_for_loss, weights, args.chunk_steps)
 
-    # --- sensitivity screen ---
     candidates = [p for p in CANDIDATE_PARAMS if base_params.get(p) is not None]
     theta_log0 = {name: jnp.log(jnp.asarray(float(base_params[name]))) for name in candidates}
-
-    print(f"\nRunning sensitivity screen over {len(candidates)} candidate parameters "
-          f"({n_steps} steps across {n_chunks} chunk(s) -- this runs the model once, jitted)...")
-    t0 = time.time()
-    # Shared across the screen and the Adam loop below (rather than two
-    # separately-constructed jax.jit wrappers around the same loss_fn) --
+    # Shared across the screen (if run) and the Adam loop below (rather than
+    # two separately-constructed jax.jit wrappers around the same loss_fn) --
     # they're called with different-sized parameter dicts (all candidates
     # vs. the selected subset) so each still compiles once regardless, but
     # there's no reason to build two wrapper objects for one function.
     grad_fn = jax.jit(jax.value_and_grad(loss_fn))
-    val0, grad0 = grad_fn(theta_log0)
-    jax.block_until_ready((val0, grad0))  # jax.jit dispatches asynchronously --
-    # without forcing completion here, this timing (and every other one in this
-    # script) would only measure dispatch, not the actual compute, making a
-    # slow call look deceptively fast right up until something later actually
-    # reads a value and blocks for the real duration.
-    t1 = time.time()
-    print(f"  baseline loss = {float(val0):.6g}  (screen took {t1 - t0:.1f}s)")
-
-    elasticity = {}
-    for name in candidates:
-        g = float(grad0[name])  # d(loss)/d(log theta) = theta * d(loss)/d(theta) -- already the elasticity
-        elasticity[name] = abs(g) if np.isfinite(g) else -1.0  # non-finite -> sort last, flagged below
-
-    ranked = sorted(elasticity.items(), key=lambda kv: kv[1], reverse=True)
-    print("\nCombined sensitivity ranking (|d(combined weighted loss)/d(log param)|, i.e. elasticity):")
-    for name, e in ranked:
-        flag = "  [NaN/Inf gradient -- excluded]" if e < 0 else ""
-        print(f"  {name:28s} {e:12.4g}  (value={float(base_params[name]):.4g}){flag}")
-
-    # --- per-variable sensitivity screen ---
-    # Same forward pass, but ranks each present variable's *own* unweighted
-    # loss separately (jax.jacrev over the stacked per-variable losses --
-    # one extra backward pass per present variable, not a separate model
-    # run), so a parameter that matters a lot to one variable can't be
-    # buried by the combined ranking just because a differently-scaled
-    # variable dominates the combined loss. See module docstring.
-    per_var_loss_fn = make_per_variable_loss_fn(
-        base_params, geometry, forcing, ice_state, init_state, obs_for_loss, args.chunk_steps, active_vars,
-    )
-    print(f"\nRunning per-variable sensitivity screen over {active_vars} "
-          f"({len(active_vars)} extra backward pass(es), same forward pass as above)...")
-    t0 = time.time()
-    jac_fn = jax.jit(jax.jacrev(per_var_loss_fn))
-    jac = jac_fn(theta_log0)
-    jax.block_until_ready(jac)  # see note above -- force real completion before timing
-    t1 = time.time()
-    print(f"  (per-variable screen took {t1 - t0:.1f}s)")
-
-    per_var_ranked = {}
-    for i, var in enumerate(active_vars):
-        elast_var = {}
-        for name in candidates:
-            g = float(jac[name][i])
-            elast_var[name] = abs(g) if np.isfinite(g) else -1.0
-        per_var_ranked[var] = sorted(elast_var.items(), key=lambda kv: kv[1], reverse=True)
-
-    for var in active_vars:
-        print(f"\nTop {args.topk_per_variable} sensitivity ranking for '{var}' "
-              f"(|d(loss_{var})/d(log param)|, unweighted, this variable only):")
-        for name, e in per_var_ranked[var][: args.topk_per_variable]:
-            flag = "  [NaN/Inf gradient -- excluded]" if e < 0 else ""
-            print(f"  {name:28s} {e:12.4g}  (value={float(base_params[name]):.4g}){flag}")
-
-    if args.sensitivity_only:
-        return
 
     if args.params:
+        # Bypass the sensitivity screen entirely: its only purpose is to
+        # *choose* which parameters to calibrate, which is moot when the
+        # caller already knows -- skipping it saves the (up to 1 + len(
+        # active_vars)) extra backward passes the screen below runs, at the
+        # cost of not seeing the ranking. A single forward+backward pass is
+        # still run, just to report a baseline loss for the "before/after"
+        # comparison at the end.
         selected = [p.strip() for p in args.params.split(",") if p.strip()]
         missing = [p for p in selected if p not in candidates]
         if missing:
             raise SystemExit(f"--params entries not in CANDIDATE_PARAMS/model_params.csv: {missing}")
-    elif args.select_mode == "combined":
-        selected = [name for name, e in ranked if e >= 0][: args.topk]
+        if args.sensitivity_only:
+            print("--sensitivity-only has no effect together with --params (there is nothing "
+                  "left to screen for once the parameters to calibrate are given explicitly) "
+                  "-- exiting without calibrating. Drop --params to run the sensitivity screen.")
+            return
+        print(f"\n--params given: skipping the sensitivity screen, calibrating {selected} directly.")
+        t0 = time.time()
+        val0, _ = grad_fn(theta_log0)
+        jax.block_until_ready(val0)  # see note below on async dispatch
+        print(f"  baseline loss = {float(val0):.6g}  ({time.time() - t0:.1f}s)")
     else:
-        # Union of each active variable's own top --topk-per-variable,
-        # order preserved by first appearance (temp's picks first, then
-        # any new names from o2, then doc), duplicates dropped.
-        selected = []
+        # --- sensitivity screen ---
+        print(f"\nRunning sensitivity screen over {len(candidates)} candidate parameters "
+              f"({n_steps} steps across {n_chunks} chunk(s) -- this runs the model once, jitted)...")
+        t0 = time.time()
+        val0, grad0 = grad_fn(theta_log0)
+        jax.block_until_ready((val0, grad0))  # jax.jit dispatches asynchronously --
+        # without forcing completion here, this timing (and every other one in this
+        # script) would only measure dispatch, not the actual compute, making a
+        # slow call look deceptively fast right up until something later actually
+        # reads a value and blocks for the real duration.
+        t1 = time.time()
+        print(f"  baseline loss = {float(val0):.6g}  (screen took {t1 - t0:.1f}s)")
+
+        elasticity = {}
+        for name in candidates:
+            g = float(grad0[name])  # d(loss)/d(log theta) = theta * d(loss)/d(theta) -- already the elasticity
+            elasticity[name] = abs(g) if np.isfinite(g) else -1.0  # non-finite -> sort last, flagged below
+
+        ranked = sorted(elasticity.items(), key=lambda kv: kv[1], reverse=True)
+        print("\nCombined sensitivity ranking (|d(combined weighted loss)/d(log param)|, i.e. elasticity):")
+        for name, e in ranked:
+            flag = "  [NaN/Inf gradient -- excluded]" if e < 0 else ""
+            print(f"  {name:28s} {e:12.4g}  (value={float(base_params[name]):.4g}){flag}")
+
+        # --- per-variable sensitivity screen ---
+        # Same forward pass, but ranks each present variable's *own* unweighted
+        # loss separately (jax.jacrev over the stacked per-variable losses --
+        # one extra backward pass per present variable, not a separate model
+        # run), so a parameter that matters a lot to one variable can't be
+        # buried by the combined ranking just because a differently-scaled
+        # variable dominates the combined loss. See module docstring.
+        per_var_loss_fn = make_per_variable_loss_fn(
+            base_params, geometry, forcing, ice_state, init_state, obs_for_loss, args.chunk_steps, active_vars,
+        )
+        print(f"\nRunning per-variable sensitivity screen over {active_vars} "
+              f"({len(active_vars)} extra backward pass(es), same forward pass as above)...")
+        t0 = time.time()
+        jac_fn = jax.jit(jax.jacrev(per_var_loss_fn))
+        jac = jac_fn(theta_log0)
+        jax.block_until_ready(jac)  # see note above -- force real completion before timing
+        t1 = time.time()
+        print(f"  (per-variable screen took {t1 - t0:.1f}s)")
+
+        per_var_ranked = {}
+        for i, var in enumerate(active_vars):
+            elast_var = {}
+            for name in candidates:
+                g = float(jac[name][i])
+                elast_var[name] = abs(g) if np.isfinite(g) else -1.0
+            per_var_ranked[var] = sorted(elast_var.items(), key=lambda kv: kv[1], reverse=True)
+
         for var in active_vars:
+            print(f"\nTop {args.topk_per_variable} sensitivity ranking for '{var}' "
+                  f"(|d(loss_{var})/d(log param)|, unweighted, this variable only):")
             for name, e in per_var_ranked[var][: args.topk_per_variable]:
-                if e >= 0 and name not in selected:
-                    selected.append(name)
-    print(f"\nCalibrating ({args.select_mode} selection): {selected}")
+                flag = "  [NaN/Inf gradient -- excluded]" if e < 0 else ""
+                print(f"  {name:28s} {e:12.4g}  (value={float(base_params[name]):.4g}){flag}")
+
+        if args.sensitivity_only:
+            return
+
+        if args.select_mode == "combined":
+            selected = [name for name, e in ranked if e >= 0][: args.topk]
+        else:
+            # Union of each active variable's own top --topk-per-variable,
+            # order preserved by first appearance (temp's picks first, then
+            # any new names from o2, then doc), duplicates dropped.
+            selected = []
+            for var in active_vars:
+                for name, e in per_var_ranked[var][: args.topk_per_variable]:
+                    if e >= 0 and name not in selected:
+                        selected.append(name)
+        print(f"\nCalibrating ({args.select_mode} selection): {selected}")
 
     theta_log = {name: theta_log0[name] for name in selected}
     x0 = {name: float(base_params[name]) for name in selected}
