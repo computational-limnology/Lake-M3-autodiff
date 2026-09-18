@@ -817,11 +817,15 @@ def temperature_step(state, forcing, geometry, params):
     """
     area, depth, volume = geometry["area"], geometry["depth"], geometry["volume"]
     dx, dt = geometry["dx"], geometry["dt"]
+    # params["wind_factor"] scales the wind speed used everywhere in this
+    # step -- see default_params()'s note on why it's applied here rather
+    # than baked into the forcing series.
+    Uw_eff = forcing["Uw"] * params["wind_factor"]
 
     u, IceSnowAttCoeff = heating_module(
         state.u, area, volume, depth, dt, dx, state.ice,
         forcing["Tair"], forcing["CC"], forcing["ea"], forcing["Jsw"], forcing["Jlw"],
-        forcing["Uw"], forcing["Pa"], forcing["RH"], params["kd_light"], state.Hi, state.Hs,
+        Uw_eff, forcing["Pa"], forcing["RH"], params["kd_light"], state.Hi, state.Hs,
         state.rho_snow, kd_ice=params["kd_ice"], kd_snow=params["kd_snow"], rho_fw=params["rho_fw"],
         sigma=params["sigma"], eps=params["eps"], emissivity=params["emissivity"], p2=params["p2"],
         Cd=params["Cd"], sw_factor=params["sw_factor"], at_factor=params["at_factor"],
@@ -830,7 +834,7 @@ def temperature_step(state, forcing, geometry, params):
 
     u, Hi, Hs, Hsi, ice, iceT, rho_snow = ice_module(
         u, dt, dx, area, forcing["Tair"], forcing["CC"], forcing["ea"], forcing["Jsw"], forcing["Jlw"],
-        forcing["Uw"], forcing["Pa"], forcing["RH"], forcing["PP"], IceSnowAttCoeff,
+        Uw_eff, forcing["Pa"], forcing["RH"], forcing["PP"], IceSnowAttCoeff,
         state.ice, params["dt_iceon_avg"], state.iceT, state.rho_snow, state.Hi, state.Hs, state.Hsi,
         eps=params["eps"], emissivity=params["emissivity"], sigma=params["sigma"], p2=params["p2"],
         Cd=params["Cd"], rho_new_snow=params["rho_new_snow"], rho_ice=params["rho_ice"],
@@ -845,12 +849,12 @@ def temperature_step(state, forcing, geometry, params):
         # in every diffusion_method branch (line 4572) -- reproduced here
         # rather than "fixed" to `geometry["latitude"]`, since the goal is
         # a numerically matching port.
-        dens_u, depth, params["g"], jnp.mean(dens_u), ice, forcing["Uw"], geometry["latitude"], u,
+        dens_u, depth, params["g"], jnp.mean(dens_u), ice, Uw_eff, geometry["latitude"], u,
         state.kz, params["Cd"], params["km"], params["weight_kz"],
     )
 
     u = diffusion_step(u, kz, area, dx, dt)
-    u, _ = mixing_step(u, depth, area, volume, dx, dt, forcing["Uw"], ice, g=params["g"], Cd=params["Cd"],
+    u, _ = mixing_step(u, depth, area, volume, dx, dt, Uw_eff, ice, g=params["g"], Cd=params["Cd"],
                         W_str=params["W_str"])
     u = convection_step(u, volume, denThresh=params["denThresh"], max_outer=params["max_conv_passes"])
 
@@ -1146,6 +1150,10 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     area, depth, volume = geometry["area"], geometry["depth"], geometry["volume"]
     dx, dt = geometry["dx"], geometry["dt"]
     docr, docl, pocr, pocl, o2 = state.docr, state.docl, state.pocr, state.pocl, state.o2
+    # params["wind_factor"] scales the wind speed used everywhere in this
+    # step -- see default_params()'s note on why it's applied here rather
+    # than baked into the forcing series.
+    Uw_eff = forcing["Uw"] * params["wind_factor"]
 
     # 1. dynamic kd_light from the *previous* step's WQ state
     depth_mask = geometry["depth_mask"]
@@ -1171,7 +1179,7 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     u, IceSnowAttCoeff = heating_module(
         state.u, area, volume, depth, dt, dx, state.ice,
         forcing["Tair"], forcing["CC"], forcing["ea"], forcing["Jsw"], forcing["Jlw"],
-        forcing["Uw"], forcing["Pa"], forcing["RH"], kd_light, state.Hi, state.Hs, state.rho_snow,
+        Uw_eff, forcing["Pa"], forcing["RH"], kd_light, state.Hi, state.Hs, state.rho_snow,
         kd_ice=params["kd_ice"], kd_snow=params["kd_snow"], rho_fw=params["rho_fw"],
         sigma=params["sigma"], eps=params["eps"], emissivity=params["emissivity"], p2=params["p2"],
         Cd=params["Cd"], sw_factor=params["sw_factor"], at_factor=params["at_factor"],
@@ -1181,7 +1189,7 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     # 4. ice
     u, Hi, Hs, Hsi, ice, iceT, rho_snow = ice_module(
         u, dt, dx, area, forcing["Tair"], forcing["CC"], forcing["ea"], forcing["Jsw"], forcing["Jlw"],
-        forcing["Uw"], forcing["Pa"], forcing["RH"], forcing["PP"], IceSnowAttCoeff,
+        Uw_eff, forcing["Pa"], forcing["RH"], forcing["PP"], IceSnowAttCoeff,
         state.ice, params["dt_iceon_avg"], state.iceT, state.rho_snow, state.Hi, state.Hs, state.Hsi,
         eps=params["eps"], emissivity=params["emissivity"], sigma=params["sigma"], p2=params["p2"],
         Cd=params["Cd"], rho_new_snow=params["rho_new_snow"], rho_ice=params["rho_ice"],
@@ -1191,7 +1199,7 @@ def full_step(state, forcing, geometry, params, kz_override=None):
 
     # 5. O2 boundary (atmospheric exchange + sediment oxygen demand)
     o2, atm_flux, do_consumption = oxygen_boundary_step(
-        u, o2, area, volume, dt, geometry["altitude"], ice, forcing["Pa"], forcing["Tair"], forcing["Uw"],
+        u, o2, area, volume, dt, geometry["altitude"], ice, forcing["Pa"], forcing["Tair"], Uw_eff,
         params["theta_r"], params["f_sod"], params["d_thick"],
     )
 
@@ -1203,7 +1211,7 @@ def full_step(state, forcing, geometry, params, kz_override=None):
         # in every diffusion_method branch (line 4572) -- reproduced here
         # rather than "fixed" to `geometry["latitude"]`, since the goal is
         # a numerically matching port.
-        dens_u, depth, params["g"], jnp.mean(dens_u), ice, forcing["Uw"], geometry["latitude"], u,
+        dens_u, depth, params["g"], jnp.mean(dens_u), ice, Uw_eff, geometry["latitude"], u,
         state.kz, params["Cd"], params["km"], params["weight_kz"],
     )
     if kz_override is None:
@@ -1226,7 +1234,7 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     # 9. mixing (temperature + all 5 WQ tracers, as concentrations)
     o2c, docrc, doclc, pocrc, poclc = o2 / volume, docr / volume, docl / volume, pocr / volume, pocl / volume
     u, (o2c, docrc, doclc, pocrc, poclc) = mixing_step(
-        u, depth, area, volume, dx, dt, forcing["Uw"], ice, g=params["g"], Cd=params["Cd"],
+        u, depth, area, volume, dx, dt, Uw_eff, ice, g=params["g"], Cd=params["Cd"],
         W_str=params["W_str"], tracers=(o2c, docrc, doclc, pocrc, poclc),
     )
     o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
@@ -1335,6 +1343,20 @@ def default_params(model_params: dict, ice_and_snow: dict = None) -> dict:
         sw_factor=float(model_params["sw_factor"]),
         at_factor=float(model_params["at_factor"]),
         turb_factor=float(model_params["turb_factor"]),
+        # NOTE: the reference `run_wq_model` applies this as a second wind
+        # multiplier *on top of* lake_config.csv's own "WindSpeed" (already
+        # baked into `forcing["Uw"]` when it's built -- see
+        # `build_forcing_series()`/`provide_meteorology()`): run_M3.py passes
+        # `wind_factor=model_params["wind_factor"]` into run_wq_model, which
+        # rebuilds its own Uw series as `wind_factor * daily_meteo.wind`
+        # (itself already scaled by lake_config's WindSpeed upstream). Ported
+        # here the same way sw_factor/at_factor/turb_factor are -- applied to
+        # the forcing value inside `temperature_step`/`full_step`, not baked
+        # into the forcing series -- so it stays a plain entry of `params`
+        # and is differentiable/calibratable like any other CANDIDATE_PARAMS
+        # entry (unlike lake_config's WindSpeed, which is fixed at forcing-
+        # construction time and not part of `params` at all).
+        wind_factor=float(model_params["wind_factor"]),
         Hgeo=float(model_params["Hgeo"]),
         dt_iceon_avg=float(ice_and_snow.get("dt_iceon_avg", 0.8)),
         rho_new_snow=250.0,

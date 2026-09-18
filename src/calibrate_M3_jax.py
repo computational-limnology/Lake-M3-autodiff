@@ -253,7 +253,7 @@ DEFAULT_TOPK_PER_VARIABLE = 5
 CANDIDATE_PARAMS = [
     "km", "weight_kz", "Cd", "denThresh",
     "kd_light", "light_water", "light_doc", "light_poc",
-    "sw_factor", "at_factor", "turb_factor", "Hgeo",
+    "sw_factor", "at_factor", "turb_factor", "wind_factor", "Hgeo",
     "theta_r", "theta_npp", "k_half",
     "resp_docr", "resp_docl", "resp_pocr", "resp_pocl",
     "settling_rate_labile", "settling_rate_refractory",
