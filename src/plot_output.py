@@ -445,16 +445,63 @@ def _plot_temperature_profiles(
     )
 
 
-def _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume=None):
+def _resolve_series_key(res, name, series=None, note=False):
+    """Return the dict key holding the `name` field (e.g. "temp", "o2",
+    "docr"), or `None` if it isn't present in this result at all. Plain
+    model output (`run_M3_jax.py`'s `res_lake1_jax_full.npz`/
+    `res_lake1.pkl`) stores a single array per field. `run_M3_mcl_jax.py`'s
+    `mcl_result.npz` instead stores a *pair* of series per field --
+    `<name>_baseline` (process-based kz) and `<name>_hybrid` (process +
+    LSTM-corrected kz) -- since the whole point of that file is comparing
+    the two. If the plain key isn't present but this baseline/hybrid pair
+    is, `--series` (default "hybrid") picks which one this plot treats as
+    "the" model value for that field; the other one just isn't plotted here
+    (see `plot_mcl_kz.py` for a side-by-side comparison of both, plus the
+    kz fields this script doesn't touch)."""
+    if name in res:
+        return name
+    baseline_key, hybrid_key = f"{name}_baseline", f"{name}_hybrid"
+    if baseline_key in res or hybrid_key in res:
+        chosen = series or "hybrid"
+        key = f"{name}_{chosen}"
+        if key not in res:
+            available = [k for k in (baseline_key, hybrid_key) if k in res]
+            raise KeyError(
+                f"--series {chosen} requested but '{key}' isn't in this file; "
+                f"available: {available}"
+            )
+        if note:
+            print(f"No '{name}' key found -- this looks like an mcl_result.npz-style file "
+                  f"(run_M3_mcl_jax.py); using '{key}' (--series {chosen}). For a side-by-side "
+                  f"baseline-vs-hybrid comparison including kz, use plot_mcl_kz.py instead.")
+        return key
+    return None
+
+
+def _resolve_temp_key(res, series=None):
+    """Like `_resolve_series_key`, but "temp" is mandatory (there's nothing
+    to plot without it) and always prints a note when it had to fall back
+    to a baseline/hybrid pair."""
+    key = _resolve_series_key(res, "temp", series, note=True)
+    if key is None:
+        raise KeyError(
+            "No 'temp' (or 'temp_baseline'/'temp_hybrid') key found in this result -- "
+            f"available keys: {sorted(res.keys())}"
+        )
+    return key
+
+
+def _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume=None, series=None):
     arrays = {}
     if "volume" in res:
         volume = to_numpy(res["volume"])
 
     for name in ["temp", "o2", "docr", "docl", "pocr", "pocl"]:
-        if name not in res:
+        key = _resolve_series_key(res, name, series)
+        if key is None:
             continue
 
-        arr = to_numpy(res[name])
+        arr = to_numpy(res[key])
         arr, _, _ = _apply_orientation(arr, time_values, depth_values)
 
         if name != "temp" and volume is not None and volume.ndim == 1 and volume.size == n_depth:
@@ -465,12 +512,14 @@ def _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume=None):
     return arrays
 
 
-def plot_result(path, observations_path=None, water_quality_observations_path=None, depths=None):
+def plot_result(path, observations_path=None, water_quality_observations_path=None, depths=None,
+                 series=None):
     res = load_result(path)
     if not isinstance(res, dict):
         raise TypeError(f"Expected a dictionary-like result, got {type(res).__name__}")
 
-    temp = to_numpy(res["temp"])
+    temp_key = _resolve_temp_key(res, series)
+    temp = to_numpy(res[temp_key])
     if temp.ndim != 2:
         raise ValueError(f"Expected 2D temperature array, got shape {temp.shape}")
 
@@ -491,7 +540,7 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
     start_time = _load_start_time(path)
     volume = to_numpy(res["volume"]) if "volume" in res else _load_model_volume(path, n_depth)
 
-    arrays = _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume)
+    arrays = _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume, series=series)
 
     x_ticks, x_labels = _build_time_labels(time_values, start_time)
     y_values = depth_values if depth_values is not None and depth_values.ndim == 1 and depth_values.size == n_depth else None
@@ -594,6 +643,15 @@ def main():
         "omitted, depths are auto-selected as before (shallowest observed depth, "
         "and the deepest depth with data covering the same years).",
     )
+    parser.add_argument(
+        "--series",
+        choices=["baseline", "hybrid"],
+        default=None,
+        help="Only relevant for an mcl_result.npz-style file (run_M3_mcl_jax.py), which "
+        "stores paired 'temp_baseline'/'temp_hybrid' (and o2/docr/docl) series instead of "
+        "single 'temp'/'o2'/'docr'/'docl' keys. Picks which one this script uses for all of "
+        "them (default: hybrid). Ignored for a plain result file that already has plain keys.",
+    )
     args = parser.parse_args()
 
     depths = None
@@ -606,7 +664,10 @@ def main():
         except ValueError:
             parser.error(f"--depths values must be numeric, got '{args.depths}'")
 
-    plot_result(args.path, args.observations, args.water_quality_observations, depths=depths)
+    plot_result(
+        args.path, args.observations, args.water_quality_observations, depths=depths,
+        series=args.series,
+    )
 
 
 if __name__ == "__main__":

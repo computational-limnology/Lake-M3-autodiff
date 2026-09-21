@@ -317,7 +317,8 @@ def bulk_fluxes(Tair, Twater, Uw, pa, RH, Cd=0.0013, z0_iters=50, l_iters=20):
 # ---------------------------------------------------------------------------
 
 
-def eddy_diffusivity_hendersonSellers(rho, depth, g, rho_0, ice, Uw, latitude, T0, kzn_prev, Cd, km, weight_kz):
+def eddy_diffusivity_hendersonSellers(rho, depth, g, rho_0, ice, Uw, latitude, T0, kzn_prev, Cd, km, weight_kz,
+                                       return_ri=False):
     k = 0.4
     Pr = 1.0
     z0 = 0.0002
@@ -383,6 +384,16 @@ def eddy_diffusivity_hendersonSellers(rho, depth, g, rho_0, ice, Uw, latitude, T
     weight = jnp.where(jnp.mean(kzn_prev) == 0.0, 1.0, weight_kz)
     kz = weight * kz + (1 - weight) * kzn_prev
 
+    if return_ri:
+        # `Ri` is always >= 0 by construction (`buoy` is floored above 0, so
+        # the sqrt argument is always >= 1) -- a depth-resolved Richardson
+        # number `run_M3_mcl_jax.py` can optionally fit its own stability
+        # function against (`kz = K0*(1+alpha*Ri)**(-n)`, the classical
+        # Munk-Anderson form) instead of directly correcting this
+        # function's own `kz` output. Not part of the default return value
+        # so every existing caller (this function's numeric-matching
+        # contract with the reference model) is completely unaffected.
+        return kz + km, Ri
     return kz + km
 
 
@@ -422,7 +433,17 @@ def heating_module(
     dens_bot = calc_dens(u[-1])
     u_new = u_new.at[-1].add(Hgeo / (dens_bot * 4184 * dx) * dt)
 
-    return u_new, IceSnowAttCoeff
+    # Net surface heat flux (W/m^2) diagnostic: the non-solar terms already
+    # summed in `Q` (net longwave + backscattering + sensible + latent),
+    # plus the net (post-albedo) incident shortwave -- i.e. the standard
+    # surface energy-balance total, evaluated before `Qsw` is spread out
+    # with depth via Beer-Lambert attenuation for the actual heating below.
+    # Not used elsewhere in the physics -- purely a diagnostic passed up
+    # through `full_step`'s returned dict for external analysis/plotting
+    # (see run_M3_mcl_jax.py's --target ri diagnostics).
+    Q_net = Q + (1 - albedo) * Jsw_eff
+
+    return u_new, IceSnowAttCoeff, Q_net
 
 
 # ---------------------------------------------------------------------------
@@ -822,7 +843,7 @@ def temperature_step(state, forcing, geometry, params):
     # than baked into the forcing series.
     Uw_eff = forcing["Uw"] * params["wind_factor"]
 
-    u, IceSnowAttCoeff = heating_module(
+    u, IceSnowAttCoeff, _ = heating_module(
         state.u, area, volume, depth, dt, dx, state.ice,
         forcing["Tair"], forcing["CC"], forcing["ea"], forcing["Jsw"], forcing["Jlw"],
         Uw_eff, forcing["Pa"], forcing["RH"], params["kd_light"], state.Hi, state.Hs,
@@ -1137,15 +1158,19 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     (`eddy_diffusivity_hendersonSellers`'s output, still always computed
     and reported as `kz_process` in the returned diagnostics dict) before
     diffusion/settling. It is either a length-`nx` array used directly, or
-    a callable `kz_override(kz_process, u, ice, dens_u, forcing) -> kz`
+    a callable `kz_override(kz_process, u, ice, dens_u, forcing, ri) -> kz`
     called with this step's *post*-heating/ice-module temperature (`u`),
-    ice flag (`ice`), and density (`dens_u`) -- i.e. exactly the
-    intermediates `kz_process` itself was computed from, which a plain
-    array can't give a caller access to (they aren't otherwise exposed
-    before this point in the step). `run_M3_mcl_jax.py` uses the callable
-    form so its NN's per-step input features (surface/bottom temperature,
-    ice state) reflect this step's own state rather than the previous
-    step's. The default (`kz_override=None`) code path is numerically
+    ice flag (`ice`), density (`dens_u`), and the same depth-resolved
+    Richardson number `eddy_diffusivity_hendersonSellers` computed
+    `kz_process` from (also reported as `ri_process` in diagnostics) --
+    i.e. exactly the intermediates `kz_process` itself was computed from,
+    which a plain array can't give a caller access to (they aren't
+    otherwise exposed before this point in the step). `run_M3_mcl_jax.py`
+    uses the callable form so its NN's per-step input features
+    (surface/bottom temperature, ice state) reflect this step's own state
+    rather than the previous step's, and so it can fit a stability function
+    directly against `ri` instead of (or as well as) correcting
+    `kz_process`. The default (`kz_override=None`) code path is numerically
     identical to before this parameter was added."""
     area, depth, volume = geometry["area"], geometry["depth"], geometry["volume"]
     dx, dt = geometry["dx"], geometry["dt"]
@@ -1176,7 +1201,7 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     pocl = pocl + perdepth_oc * params["prop_oc_pocl"]
 
     # 3. heating (uses the dynamic kd_light, not a held-constant value)
-    u, IceSnowAttCoeff = heating_module(
+    u, IceSnowAttCoeff, Q_net = heating_module(
         state.u, area, volume, depth, dt, dx, state.ice,
         forcing["Tair"], forcing["CC"], forcing["ea"], forcing["Jsw"], forcing["Jlw"],
         Uw_eff, forcing["Pa"], forcing["RH"], kd_light, state.Hi, state.Hs, state.rho_snow,
@@ -1205,19 +1230,19 @@ def full_step(state, forcing, geometry, params, kz_override=None):
 
     # 6. eddy diffusivity
     dens_u = calc_dens(u)
-    kz_process = eddy_diffusivity_hendersonSellers(
+    kz_process, ri_process = eddy_diffusivity_hendersonSellers(
         # NOTE: the reference's `run_wq_model` calls this with a hardcoded
         # latitude (43.100948) instead of the lake's configured latitude,
         # in every diffusion_method branch (line 4572) -- reproduced here
         # rather than "fixed" to `geometry["latitude"]`, since the goal is
         # a numerically matching port.
         dens_u, depth, params["g"], jnp.mean(dens_u), ice, Uw_eff, geometry["latitude"], u,
-        state.kz, params["Cd"], params["km"], params["weight_kz"],
+        state.kz, params["Cd"], params["km"], params["weight_kz"], return_ri=True,
     )
     if kz_override is None:
         kz = kz_process
     elif callable(kz_override):
-        kz = kz_override(kz_process, u, ice, dens_u, forcing)
+        kz = kz_override(kz_process, u, ice, dens_u, forcing, ri_process)
     else:
         kz = kz_override
 
@@ -1240,7 +1265,7 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
     pocr, pocl = pocrc * volume, poclc * volume
 
-    # 10. convection (temperature only)
+    # 10. convection (temperature only), this checks for density instabilities
     u = convection_step(u, volume, denThresh=params["denThresh"], max_outer=params["max_conv_passes"])
 
     # 11. production/consumption reactions
@@ -1267,7 +1292,10 @@ def full_step(state, forcing, geometry, params, kz_override=None):
         u=u, kz=kz, ice=ice, Hi=Hi, Hs=Hs, Hsi=Hsi, iceT=iceT, rho_snow=rho_snow,
         o2=o2, docr=docr, docl=docl, pocr=pocr, pocl=pocl,
     )
-    diagnostics = dict(kd_light=kd_light, atm_flux=atm_flux, kz_process=kz_process, **diag)
+    diagnostics = dict(
+        kd_light=kd_light, atm_flux=atm_flux, kz_process=kz_process, ri_process=ri_process,
+        Q_net=Q_net, **diag,
+    )
     return new_state, diagnostics
 
 

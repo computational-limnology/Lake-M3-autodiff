@@ -11,9 +11,15 @@ Usage:
         [--cal-steps N] [--cal-chunk-steps N] [--cal-iters K] [--cal-lr LR]
         [--cal-early-stop-patience N] [--cal-early-stop-tol TOL]
         [--cal-variables temp,o2,doc]
+        [--mcl-target {kz,ri}]
         [--hidden-size H] [--depth-basis-degree D] [--kz-reg LAMBDA]
+        [--ri-k0-init K0] [--ri-alpha-init A] [--ri-n-init N] [--ri-memory-hours H]
+        [--max-log-correction C] [--max-kz KZ]
+        [--max-log-k0 C] [--max-log-alpha C] [--max-log-n C]
         [--mcl-steps N] [--mcl-chunk-steps N] [--mcl-iters K] [--mcl-lr LR]
         [--mcl-early-stop-patience N] [--mcl-early-stop-tol TOL]
+        [--mcl-test-early-stop-patience N] [--mcl-test-early-stop-tol TOL]
+        [--mcl-test-worsen-patience N]
         [--train-start DATE --train-end DATE --test-start DATE --test-end DATE]
         [--seed S] [--out result.npz] [--nn-params-out nn_params.pkl]
         [--skip-calibration] [--skip-mcl]
@@ -48,7 +54,19 @@ stage 1) against the now-updated `model_params.csv`, so the LSTM kz
 correction is trained on top of the calibrated physical parameters rather
 than the pre-calibration ones. All physical parameters are held fixed
 during this stage, exactly as `run_M3_mcl_jax.py` does on its own -- only
-its network weights are trained.
+its network weights are trained. `--mcl-target` picks what it fits:
+`kz` (default) corrects `kz_process` directly with a depth-basis
+polynomial (`--depth-basis-degree`/`--kz-reg`/`--max-log-correction`/
+`--max-kz`); `ri` instead fits K0, alpha, n of the Munk-Anderson stability
+function `kz = K0*(1+alpha*Ri)**(-n)` against the closure's own
+Richardson number (`--ri-k0-init`/`--ri-alpha-init`/`--ri-n-init`/
+`--max-log-k0`/`--max-log-alpha`/`--max-log-n`) -- see
+`run_M3_mcl_jax.py`'s own module docstring (`DEFAULT_TARGET` comment) for
+the full rationale and why `ri` is inherently more stable regardless of
+what the network outputs. In `ri` mode, alpha/n are additionally smoothed
+with an explicit couple-hour EMA memory (`--ri-memory-hours`) rather than
+reacting to the LSTM's raw per-step output directly -- see
+`run_M3_mcl_jax.py`'s `DEFAULT_RI_MEMORY_HOURS` comment.
 
 `--skip-calibration` leaves `model_params.csv` untouched (stage 2 is
 skipped along with it, since there is nothing new to apply) and goes
@@ -87,11 +105,15 @@ from calibrate_M3_jax import (
 from run_M3_mcl_jax import (
     DEFAULT_HIDDEN_SIZE, DEFAULT_DEPTH_BASIS_DEGREE, DEFAULT_KZ_REG,
     DEFAULT_TRAIN_START, DEFAULT_TRAIN_END, DEFAULT_TEST_START, DEFAULT_TEST_END,
+    DEFAULT_TARGET, DEFAULT_MAX_LOG_CORRECTION, DEFAULT_MAX_KZ,
+    DEFAULT_RI_K0_INIT, DEFAULT_RI_ALPHA_INIT, DEFAULT_RI_N_INIT, DEFAULT_RI_MEMORY_HOURS,
+    DEFAULT_MAX_LOG_K0, DEFAULT_MAX_LOG_ALPHA, DEFAULT_MAX_LOG_N,
     DEFAULT_ITERS as MCL_DEFAULT_ITERS,
     DEFAULT_LR as MCL_DEFAULT_LR,
     DEFAULT_CHUNK_STEPS as MCL_DEFAULT_CHUNK_STEPS,
     DEFAULT_EARLY_STOP_PATIENCE as MCL_DEFAULT_EARLY_STOP_PATIENCE,
     DEFAULT_EARLY_STOP_TOL as MCL_DEFAULT_EARLY_STOP_TOL,
+    DEFAULT_TEST_EARLY_STOP_PATIENCE, DEFAULT_TEST_EARLY_STOP_TOL, DEFAULT_TEST_WORSEN_PATIENCE,
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -141,13 +163,26 @@ def run_mcl_stage(data_dir_abs, args):
     if args.mcl_steps is not None:
         cmd += ["--steps", str(args.mcl_steps)]
     cmd += ["--chunk-steps", str(args.mcl_chunk_steps)]
+    cmd += ["--target", args.mcl_target]
     cmd += ["--hidden-size", str(args.hidden_size)]
     cmd += ["--depth-basis-degree", str(args.depth_basis_degree)]
     cmd += ["--kz-reg", str(args.kz_reg)]
+    cmd += ["--max-log-correction", str(args.max_log_correction)]
+    cmd += ["--max-kz", str(args.max_kz)]
+    cmd += ["--ri-k0-init", str(args.ri_k0_init)]
+    cmd += ["--ri-alpha-init", str(args.ri_alpha_init)]
+    cmd += ["--ri-n-init", str(args.ri_n_init)]
+    cmd += ["--ri-memory-hours", str(args.ri_memory_hours)]
+    cmd += ["--max-log-k0", str(args.max_log_k0)]
+    cmd += ["--max-log-alpha", str(args.max_log_alpha)]
+    cmd += ["--max-log-n", str(args.max_log_n)]
     cmd += ["--iters", str(args.mcl_iters)]
     cmd += ["--lr", str(args.mcl_lr)]
     cmd += ["--early-stop-patience", str(args.mcl_early_stop_patience)]
     cmd += ["--early-stop-tol", str(args.mcl_early_stop_tol)]
+    cmd += ["--test-early-stop-patience", str(args.mcl_test_early_stop_patience)]
+    cmd += ["--test-early-stop-tol", str(args.mcl_test_early_stop_tol)]
+    cmd += ["--test-worsen-patience", str(args.mcl_test_worsen_patience)]
     cmd += ["--train-start", args.train_start, "--train-end", args.train_end]
     cmd += ["--test-start", args.test_start, "--test-end", args.test_end]
     cmd += ["--seed", str(args.seed)]
@@ -205,15 +240,53 @@ def main():
     mcl.add_argument("--hidden-size", type=int, default=DEFAULT_HIDDEN_SIZE,
                       help=f"LSTM hidden size (default {DEFAULT_HIDDEN_SIZE})")
     mcl.add_argument("--depth-basis-degree", type=int, default=DEFAULT_DEPTH_BASIS_DEGREE,
-                      help=f"degree of the polynomial-in-depth kz correction (default {DEFAULT_DEPTH_BASIS_DEGREE})")
+                      help=f"degree of the polynomial-in-depth kz correction (default {DEFAULT_DEPTH_BASIS_DEGREE}); "
+                           "ignored when --mcl-target ri")
     mcl.add_argument("--kz-reg", type=float, default=DEFAULT_KZ_REG,
                       help=f"L2 penalty on the NN's weights (default {DEFAULT_KZ_REG})")
+    mcl.add_argument("--mcl-target", choices=["kz", "ri"], default=DEFAULT_TARGET,
+                      help=f"what run_M3_mcl_jax.py fits (default {DEFAULT_TARGET}): 'kz' fits a "
+                           "depth-basis multiplicative correction on top of the process-based kz "
+                           "estimate; 'ri' fits a Munk-Anderson-style stability function "
+                           "kz = K0*(1+alpha*Ri)**(-n) directly against the Richardson number Ri "
+                           "from eddy_diffusivity_hendersonSellers, with the NN estimating K0, "
+                           "alpha and n. See run_M3_mcl_jax.py's own DEFAULT_TARGET docstring "
+                           "comment for the full rationale.")
+    mcl.add_argument("--ri-k0-init", type=float, default=DEFAULT_RI_K0_INIT,
+                      help=f"initial K0 (m^2/s) for --mcl-target ri (default {DEFAULT_RI_K0_INIT})")
+    mcl.add_argument("--ri-alpha-init", type=float, default=DEFAULT_RI_ALPHA_INIT,
+                      help=f"initial alpha for --mcl-target ri (default {DEFAULT_RI_ALPHA_INIT})")
+    mcl.add_argument("--ri-n-init", type=float, default=DEFAULT_RI_N_INIT,
+                      help=f"initial n (stability exponent) for --mcl-target ri (default {DEFAULT_RI_N_INIT})")
+    mcl.add_argument("--ri-memory-hours", type=float, default=DEFAULT_RI_MEMORY_HOURS,
+                      help=f"e-folding memory time (hours) for alpha/n's EMA smoothing under "
+                           f"--mcl-target ri (default {DEFAULT_RI_MEMORY_HOURS}); see "
+                           "run_M3_mcl_jax.py's DEFAULT_RI_MEMORY_HOURS comment.")
+    mcl.add_argument("--max-log-correction", type=float, default=DEFAULT_MAX_LOG_CORRECTION,
+                      help=f"log-space clip on the --mcl-target kz correction (default {DEFAULT_MAX_LOG_CORRECTION})")
+    mcl.add_argument("--max-kz", type=float, default=DEFAULT_MAX_KZ,
+                      help=f"hard ceiling (m^2/s) on the corrected kz, both targets (default {DEFAULT_MAX_KZ})")
+    mcl.add_argument("--max-log-k0", type=float, default=DEFAULT_MAX_LOG_K0,
+                      help=f"log-space clip on K0 for --mcl-target ri (default {DEFAULT_MAX_LOG_K0})")
+    mcl.add_argument("--max-log-alpha", type=float, default=DEFAULT_MAX_LOG_ALPHA,
+                      help=f"log-space clip on alpha for --mcl-target ri (default {DEFAULT_MAX_LOG_ALPHA})")
+    mcl.add_argument("--max-log-n", type=float, default=DEFAULT_MAX_LOG_N,
+                      help=f"log-space clip on n for --mcl-target ri (default {DEFAULT_MAX_LOG_N})")
     mcl.add_argument("--mcl-iters", type=int, default=MCL_DEFAULT_ITERS,
                       help=f"max Adam iterations for mcl training (default {MCL_DEFAULT_ITERS})")
     mcl.add_argument("--mcl-lr", type=float, default=MCL_DEFAULT_LR,
                       help=f"mcl Adam learning rate (default {MCL_DEFAULT_LR})")
     mcl.add_argument("--mcl-early-stop-patience", type=int, default=MCL_DEFAULT_EARLY_STOP_PATIENCE)
     mcl.add_argument("--mcl-early-stop-tol", type=float, default=MCL_DEFAULT_EARLY_STOP_TOL)
+    mcl.add_argument("--mcl-test-early-stop-patience", type=int, default=DEFAULT_TEST_EARLY_STOP_PATIENCE,
+                      help="stop mcl training if test-window RMSE plateaus even while training loss "
+                           f"keeps improving (default {DEFAULT_TEST_EARLY_STOP_PATIENCE}; 0 disables) -- "
+                           "see run_M3_mcl_jax.py's DEFAULT_TEST_EARLY_STOP_PATIENCE comment.")
+    mcl.add_argument("--mcl-test-early-stop-tol", type=float, default=DEFAULT_TEST_EARLY_STOP_TOL)
+    mcl.add_argument("--mcl-test-worsen-patience", type=int, default=DEFAULT_TEST_WORSEN_PATIENCE,
+                      help="stop mcl training faster if test-window RMSE actively regresses past its "
+                           f"best-so-far value for this many consecutive iterations (default "
+                           f"{DEFAULT_TEST_WORSEN_PATIENCE}; 0 disables) -- an overfitting guard.")
     mcl.add_argument("--train-start", type=str, default=DEFAULT_TRAIN_START)
     mcl.add_argument("--train-end", type=str, default=DEFAULT_TRAIN_END)
     mcl.add_argument("--test-start", type=str, default=DEFAULT_TEST_START)
