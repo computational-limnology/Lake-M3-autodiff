@@ -1228,7 +1228,16 @@ def full_step(state, forcing, geometry, params, kz_override=None):
         params["theta_r"], params["f_sod"], params["d_thick"],
     )
 
-    # 6. eddy diffusivity
+    # 6. mixing (temperature + all 5 WQ tracers, as concentrations)
+    o2c, docrc, doclc, pocrc, poclc = o2 / volume, docr / volume, docl / volume, pocr / volume, pocl / volume
+    u, (o2c, docrc, doclc, pocrc, poclc) = mixing_step(
+        u, depth, area, volume, dx, dt, Uw_eff, ice, g=params["g"], Cd=params["Cd"],
+        W_str=params["W_str"], tracers=(o2c, docrc, doclc, pocrc, poclc),
+    )
+    o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
+    pocr, pocl = pocrc * volume, poclc * volume
+
+    # 7. eddy diffusivity
     dens_u = calc_dens(u)
     kz_process, ri_process = eddy_diffusivity_hendersonSellers(
         # NOTE: the reference's `run_wq_model` calls this with a hardcoded
@@ -1246,24 +1255,15 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     else:
         kz = kz_override
 
-    # 7. diffusion (temperature + O2 + DOCr + DOCl, as concentrations)
+    # 8. diffusion (temperature + O2 + DOCr + DOCl, as concentrations)
     o2c, docrc, doclc = o2 / volume, docr / volume, docl / volume
     u, o2c, docrc, doclc = diffusion_step_wq(u, o2c, docrc, doclc, kz, area, dx, dt)
     o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
 
-    # 8. POC settling
+    # 9. POC settling
     pocr, pocl = poc_settling_step(
         pocr, pocl, kz, params["settling_rate_refractory"], params["settling_rate_labile"], dx, dt,
     )
-
-    # 9. mixing (temperature + all 5 WQ tracers, as concentrations)
-    o2c, docrc, doclc, pocrc, poclc = o2 / volume, docr / volume, docl / volume, pocr / volume, pocl / volume
-    u, (o2c, docrc, doclc, pocrc, poclc) = mixing_step(
-        u, depth, area, volume, dx, dt, Uw_eff, ice, g=params["g"], Cd=params["Cd"],
-        W_str=params["W_str"], tracers=(o2c, docrc, doclc, pocrc, poclc),
-    )
-    o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
-    pocr, pocl = pocrc * volume, poclc * volume
 
     # 10. convection (temperature only), this checks for density instabilities
     u = convection_step(u, volume, denThresh=params["denThresh"], max_outer=params["max_conv_passes"])

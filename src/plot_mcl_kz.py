@@ -15,10 +15,12 @@ Layout (one figure, three rows):
      log-x/depth-y axis -- lets you see *where* and *by how much* the
      network is adjusting mixing, rather than only the aggregate heatmap.
   3. Temperature time series at two depths (`--depths`, default 1,30 m):
-     baseline and hybrid model temperature plus the observed record
-     (`L0001-HD.csv` + buoy `ravn_2023/2024.json`, via
-     `plot_output._load_temperature_observations`) at the nearest
-     observed depth, with the training/test windows shaded for reference.
+     baseline and hybrid model temperature plus the observed record (read
+     via `plot_output._load_temperature_observations`, which follows
+     `run_config.csv`'s `u_ini_file` -- run `integrate_buoy_temperature.py`
+     once beforehand if the high-frequency buoy record should be included)
+     at the nearest observed depth, with the training/test windows shaded
+     for reference.
 
 Usage:
     python src/plot_mcl_kz.py Ravn/mcl_result.npz
@@ -107,8 +109,9 @@ def main():
                          help="Comma-separated dates (e.g. '2023-02-01,2023-07-01') to use for "
                               "the kz(depth) snapshot panels instead of evenly-spaced defaults.")
     parser.add_argument("--observations", type=str, default=None,
-                         help="Optional path to L0001-HD.csv; by default it is looked up beside "
-                              "mcl_result.npz (buoy ravn_2023/2024.json are picked up the same way).")
+                         help="Optional explicit path to a temperature observations CSV; by default "
+                              "it is read from run_config.csv's u_ini_file, looked up beside "
+                              "mcl_result.npz.")
     parser.add_argument("--out", type=str, default=None,
                          help="Output image path (default: mcl_kz_plot.png beside mcl_result.npz).")
     args = parser.parse_args()

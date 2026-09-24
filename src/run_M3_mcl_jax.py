@@ -76,7 +76,8 @@ cannot represent, being monotonic in depth by construction):
     2023, `--test-start/--test-end` default 2024) rather than a random
     split: avoids leaking test-period information into the LSTM's
     recurrent state during training, and both years now have full hourly
-    buoy coverage (see `calibrate_M3_jax.load_buoy_temperature`). The
+    buoy coverage once `integrate_buoy_temperature.py` has been run (see
+    `observation_data.load_buoy_temperature`). The
     physical simulation itself still starts from `run_config.csv`'s own
     `start_time` (2022 here, providing a needed thermal spin-up); only the
     *loss* is restricted to the training window's observations.
@@ -407,6 +408,7 @@ def simulate_baseline(phys_params, geometry, forcing, ice_state, init_state):
         outputs = dict(
             u=new_state.u, kz=new_state.kz,
             o2=new_state.o2, docr=new_state.docr, docl=new_state.docl,
+            pocr=new_state.pocr, pocl=new_state.pocl,
         )
         return new_state, outputs
 
@@ -767,7 +769,7 @@ def main():
     windfactor = float(lake_config["WindSpeed"])
     nx = int(run_config["nx"]); dt = float(run_config["dt"]); dx = float(run_config["dx"])
     area, depth, volume, hypso_weight = get_hypsography(
-        "./lake_bathymetry.csv", dx=dx, nx=nx, outflow_depth=float(lake_config["outflow_depth"]),
+        hypsofile=run_config["hypso_ini_file"], dx=dx, nx=nx, outflow_depth=float(lake_config["outflow_depth"]),
     )
 
     desired_start = pd.Timestamp(run_config["start_time"])
@@ -833,8 +835,8 @@ def main():
         raise SystemExit("Train window falls outside the simulated record -- adjust --train-start/--train-end "
                           "or --steps.")
 
-    print("Loading temperature observations (L0001-HD.csv + buoy ravn_2023/2024.json)...")
-    obs = load_observations("./", depth, volume, desired_start, step_times, dt)
+    print("Loading temperature observations (run_config.csv's u_ini_file)...")
+    obs = load_observations("./", depth, volume, desired_start, step_times, dt, run_config=run_config)
     obs_train = split_obs_by_step_range(obs["temp"], train_lo, train_hi)
     obs_test = split_obs_by_step_range(obs["temp"], test_lo, test_hi)
     if obs_train is None:
@@ -1054,6 +1056,8 @@ def main():
         o2_baseline=np.asarray(baseline["o2"]), o2_hybrid=np.asarray(hybrid["o2"]),
         docr_baseline=np.asarray(baseline["docr"]), docr_hybrid=np.asarray(hybrid["docr"]),
         docl_baseline=np.asarray(baseline["docl"]), docl_hybrid=np.asarray(hybrid["docl"]),
+        pocr_baseline=np.asarray(baseline["pocr"]), pocr_hybrid=np.asarray(hybrid["pocr"]),
+        pocl_baseline=np.asarray(baseline["pocl"]), pocl_hybrid=np.asarray(hybrid["pocl"]),
         train_lo=train_lo, train_hi=train_hi, test_lo=test_lo, test_hi=test_hi,
         # raw meteorological wind speed (lake_config.csv's WindSpeed factor
         # already applied, same series the model itself is driven by, before

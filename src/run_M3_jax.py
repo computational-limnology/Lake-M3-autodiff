@@ -106,7 +106,7 @@ def main():
     dx = float(run_config["dx"])
 
     area, depth, volume, hypso_weight = get_hypsography(
-        hypsofile="./lake_bathymetry.csv", dx=dx, nx=nx, outflow_depth=float(lake_config["outflow_depth"])
+        hypsofile=run_config["hypso_ini_file"], dx=dx, nx=nx, outflow_depth=float(lake_config["outflow_depth"])
     )
 
     desired_start = pd.Timestamp(run_config["start_time"])
@@ -211,7 +211,7 @@ def main():
         out_path,
         temp=np.asarray(per_step["u"]), o2=np.asarray(per_step["o2"]), docr=np.asarray(per_step["docr"]),
         docl=np.asarray(per_step["docl"]), pocr=np.asarray(per_step["pocr"]), pocl=np.asarray(per_step["pocl"]),
-        times=step_times, depth=np.asarray(depth),
+        times=step_times, depth=np.asarray(depth), volume=np.asarray(volume),
     )
     print(f"Saved results to {out_path}")
 

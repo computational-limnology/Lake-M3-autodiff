@@ -11,7 +11,7 @@ oxygen "do" and dissolved organic carbon "doc", both in mg/L), using
 
 Usage:
     python src/calibrate_M3_jax.py Ravn [--steps N] [--chunk-steps N] [--iters K]
-        [--lr LR] [--topk K] [--params p1,p2,...] [--variables temp,o2,doc] [--sensitivity-only]
+        [--lr LR] [--topk K] [--params p1,p2,...] [--variables temp,o2,doc,poc] [--sensitivity-only]
 
     `--params p1,p2,...` skips the sensitivity screen entirely (both the
     combined and per-variable rankings) and calibrates exactly the named
@@ -33,31 +33,47 @@ mass units the model itself uses -- no extra factor needed). DOC is
 compared against `docr + docl` combined, since the model only initializes
 that 75/25 refractory/labile split heuristically and there is no separate
 refractory/labile observation to calibrate each piece against. Temperature
-needs no conversion.
+needs no conversion. POC ("particulate organic carbon") is handled exactly
+the same way as DOC: compared against `pocr + pocl` combined, converted
+from mg/L the same `obs_mass = obs_concentration_mgL * volume` way. Unlike
+temp/O2/DOC, POC observations are optional at the dataset level, not just
+possibly absent from a given window -- Ravn's `L0001-WQ.csv` has no "poc"
+rows at all, while Mendota's `ME_obs_depths3_wpoc.csv` does. This falls out
+for free from the same "`None` if no matching rows produce a usable
+profile" handling every other variable already gets in `load_observations()`
+below: a dataset without POC observations simply gets `obs["poc"] is None`,
+which drops out of the loss, the sensitivity screens, `--variables`
+validation, and the final metrics table exactly like an out-of-window
+temp/O2/DOC would, with zero dataset-specific branching anywhere in this
+script.
 
-Observation matching: `L0001-HD.csv`/`L0001-WQ.csv` are long-format,
-irregular in both time (roughly monthly profile dates) and depth. For
-each profile date, the observed depths are linearly interpolated onto the
-model's depth grid (`processBased_lakeModel_functions.get_hypsography`'s
-cell-centered `depth` array); grid points beyond the observed depth range
-are masked out rather than extrapolated (matching the spirit of
+Observation matching: temperature/O2/DOC observations (read from
+`run_config.csv`'s `u_ini_file`/`wq_ini_file` -- `L0001-HD.csv`/
+`L0001-WQ.csv` for Ravn -- via `observation_data.py`, shared with every
+other script in this project) are long-format, irregular in both time
+(roughly monthly profile dates) and depth. For each profile date, the
+observed depths are linearly interpolated onto the model's depth grid
+(`processBased_lakeModel_functions.get_hypsography`'s cell-centered
+`depth` array); grid points beyond the observed depth range are masked
+out rather than extrapolated (matching the spirit of
 `initial_profile`/`wq_initial_profile`'s own "extend to lake max depth by
 repeating the deepest observation" rule would be an unjustified
 assumption for calibration targets, so we simply don't score those
 points). Each profile date is mapped to the nearest simulation step via
 `round((obs_datetime - start_date).total_seconds() / dt)`.
 
-Buoy temperature data (`ravn_2023.json`/`ravn_2024.json`, plus
-`sensor_level_buoy.sen` for the sensor->depth mapping), if present in the
-data directory, is folded into the temperature observations the same way
-(see `load_buoy_temperature()`): it is a fixed-depth thermistor chain (18
-sensors) natively sampled roughly every 15 minutes, averaged down to
-hourly bins, reshaped to the same long-format schema as `L0001-HD.csv`,
-and treated as one additional "profile" per hourly timestamp. This can
-add hundreds to thousands of extra profile dates within its coverage
-window, all scored the same way as the sparser HD profiles.
-`plot_output.py`'s `_load_temperature_observations()` merges it in
-identically for plotting.
+The high-frequency buoy thermistor-chain record (`ravn_2023.json`/
+`ravn_2024.json`, plus `sensor_level_buoy.sen` for the sensor->depth
+mapping), where available, is not read directly by this script (or by
+`plot_output.py`): run `integrate_buoy_temperature.py` once first to fold
+it into `u_ini_file` itself (see that script's module docstring and
+`observation_data.load_buoy_temperature()`) -- it is a fixed-depth
+thermistor chain (18 sensors) natively sampled roughly every 15 minutes,
+averaged down to hourly bins, reshaped to the same long-format schema as
+`u_ini_file`, and merged in as one additional "profile" per hourly
+timestamp. This can add hundreds to thousands of extra profile dates
+within its coverage window, all scored the same way as the sparser
+manual profiles, with no buoy-specific code needed in this script at all.
 
 Gradient horizon and truncated backpropagation through time (TBPTT):
 `jax_lakeModel_functions.py`'s module docstring documents two genuine,
@@ -176,11 +192,12 @@ runs the full `--iters`. Either way the best iterate found (not
 necessarily the last one) is what gets reported/saved.
 
 Restricting which variables count towards calibration (`--variables`):
-by default every variable with observations in the window (temp/O2/DOC,
-whichever are present) contributes to the loss and to the sensitivity
-screens. `--variables temp` or `--variables o2,temp` (etc.) restricts
-this to a named subset -- e.g. "only calibrate against temperature" even
-though O2/DOC observations also exist in the window. The excluded
+by default every variable with observations in the window (temp/O2/DOC/POC,
+whichever are present -- POC only for datasets whose `wq_ini_file` has
+"poc" rows, e.g. Mendota but not Ravn) contributes to the loss and to the
+sensitivity screens. `--variables temp` or `--variables o2,temp` (etc.)
+restricts this to a named subset -- e.g. "only calibrate against
+temperature" even though O2/DOC/POC observations also exist in the window. The excluded
 variable(s) are dropped entirely from the loss (so their gradient
 contributes nothing) and from the per-variable sensitivity screen/
 selection, but -- since they cost nothing extra to compute, being read
@@ -201,7 +218,6 @@ to `calibration_metrics.csv` alongside `calibration_result.csv` (the
 parameter table).
 """
 import argparse
-import json
 import os
 import time
 from copy import deepcopy
@@ -225,6 +241,10 @@ from jax_lakeModel_functions import (
     default_params, default_geometry_wq, make_initial_state_full, full_step,
 )
 from run_M3_jax import build_forcing_series, add_wq_forcing_series
+from observation_data import (
+    load_temperature_dataframe, load_water_quality_dataframe,
+    load_buoy_temperature,  # noqa: F401 -- re-exported for backward-compat imports of this name
+)
 
 
 # `--steps` defaults to None (the full available record -- safe now thanks
@@ -262,81 +282,27 @@ CANDIDATE_PARAMS = [
 ]
 
 
-def load_buoy_temperature(
-    data_dir,
-    json_files=("ravn_2023.json", "ravn_2024.json"),
-    sensor_file="sensor_level_buoy.sen",
-):
-    """Load high-frequency buoy thermistor-chain temperature data from the
-    raw JSON exports (`ravn_2023.json`/`ravn_2024.json`), if present,
-    average it down to hourly values, and reshape it to the same
-    long-format schema as `L0001-HD.csv` (`datetime`, `Depth_meter`,
-    `Water_Temperature_celsius`).
+def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_config=None):
+    """Load temperature/O2/DOC observations, restrict to the simulation
+    window, and build per-variable dicts of (step_idx, values, mask)
+    arrays on the model's depth grid. `values` are in the model's own
+    units: degC for temperature, mass (obs_mgL * volume) for o2/doc.
+    Returns a dict with keys "temp", "o2", "doc" (each None if no
+    observations fall in the simulation window).
 
-    Each JSON file has the shape
-    `{"data": {"tempCableReadings": {"timestamps": [...], "t1": [...],
-    ..., "t18": [...]}}}`, with `timestamps` as Unix epoch seconds (native
-    sampling is irregular, roughly every 15 minutes) and `t1..t18` the
-    temperature (degC) at each of the 18 thermistor depths (looked up from
-    `sensor_file`, whitespace-delimited with columns `sensor, position,
-    specification`, where `position` is that sensor's depth in meters).
-    Native readings are averaged into hourly bins (`resample("1h").mean()`)
-    before being reshaped to long format, since the native ~15-minute
-    cadence is finer than the model's hourly timestep. Any of `json_files`
-    that is missing is skipped; returns `None` if none are found, or if
-    `sensor_file` is missing (e.g. for datasets other than Ravn), so this
-    is a no-op unless the buoy files are actually present."""
-    sensor_path = os.path.join(data_dir, sensor_file)
-    if not os.path.exists(sensor_path):
-        return None
-    sensors = pd.read_csv(sensor_path, sep=r"\s+")
-    depth_by_sensor = dict(zip(sensors["sensor"].astype(int), sensors["position"].astype(float)))
-
-    hourly_frames = []
-    for json_file in json_files:
-        json_path = os.path.join(data_dir, json_file)
-        if not os.path.exists(json_path):
-            continue
-        with open(json_path) as f:
-            payload = json.load(f)
-        readings = payload["data"]["tempCableReadings"]
-        sensor_cols = [k for k in readings if k != "timestamps"]
-        wide = pd.DataFrame(
-            {col: readings[col] for col in sensor_cols},
-            index=pd.to_datetime(np.asarray(readings["timestamps"], dtype="int64"), unit="s"),
-        ).sort_index()
-        hourly_frames.append(wide.resample("1h").mean())
-
-    if not hourly_frames:
-        return None
-
-    hourly = pd.concat(hourly_frames).sort_index()
-    hourly = hourly[~hourly.index.duplicated(keep="first")]
-    hourly.index.name = "datetime"
-
-    long = hourly.reset_index().melt(
-        id_vars="datetime", var_name="sensor", value_name="Water_Temperature_celsius"
-    )
-    long["Depth_meter"] = long["sensor"].str[1:].astype(int).map(depth_by_sensor)
-    long = long.dropna(subset=["Depth_meter", "Water_Temperature_celsius"])
-    return long[["datetime", "Depth_meter", "Water_Temperature_celsius"]]
-
-
-def load_observations(data_dir, depth, volume, start_date, step_times, dt):
-    """Load L0001-HD.csv/L0001-WQ.csv, restrict to the simulation window,
-    and build per-variable dicts of (step_idx, values, mask) arrays on the
-    model's depth grid. `values` are in the model's own units: degC for
-    temperature, mass (obs_mgL * volume) for o2/doc. Returns a dict with
-    keys "temp", "o2", "doc" (each None if no observations fall in the
-    simulation window).
-
-    Temperature observations additionally include the high-frequency buoy
-    thermistor-chain record (`ravn_2023.json`/`ravn_2024.json`, averaged
-    to hourly), if present, concatenated onto `L0001-HD.csv` before
-    gridding -- see `load_buoy_temperature()`. Each buoy timestamp becomes
-    its own "profile" (matching `L0001-HD.csv`'s per-datetime grouping),
-    so this can add hundreds to thousands of extra profile dates within
-    the buoy's coverage window."""
+    Temperature comes from `run_config`'s `u_ini_file` (falling back to
+    `L0001-HD.csv` if `run_config` isn't given) and O2/DOC from
+    `wq_ini_file` (falling back to `L0001-WQ.csv`) -- see
+    `observation_data.load_temperature_dataframe()`/
+    `load_water_quality_dataframe()`. If the high-frequency buoy
+    thermistor-chain record should be included, run
+    `integrate_buoy_temperature.py` once first to fold `ravn_2023.json`/
+    `ravn_2024.json` into `u_ini_file` directly -- each of its hourly
+    timestamps then becomes its own "profile" (matching `u_ini_file`'s
+    per-datetime grouping) automatically, with no buoy-specific code
+    needed here any more. This can add hundreds to thousands of extra
+    profile dates within the buoy's coverage window, all scored the same
+    way as the sparser manual profiles."""
     depth = np.asarray(depth)
     volume = np.asarray(volume)
     n_steps = len(step_times)
@@ -385,22 +351,25 @@ def load_observations(data_dir, depth, volume, start_date, step_times, dt):
             mask=jnp.asarray(np.stack(mask_list)),
         )
 
-    hd = pd.read_csv(os.path.join(data_dir, "L0001-HD.csv"))
-    hd["datetime"] = pd.to_datetime(hd["datetime"])
-    buoy = load_buoy_temperature(data_dir)
-    if buoy is not None:
-        hd = pd.concat(
-            [hd[["datetime", "Depth_meter", "Water_Temperature_celsius"]], buoy],
-            ignore_index=True,
-        )
-    temp_obs = build(hd, "Depth_meter", "Water_Temperature_celsius", mass_convert=False)
+    hd = load_temperature_dataframe(data_dir, run_config)
+    temp_obs = build(hd, "Depth_meter", "Water_Temperature_celsius", mass_convert=False) if hd is not None else None
 
-    wq = pd.read_csv(os.path.join(data_dir, "L0001-WQ.csv"))
-    wq["datetime"] = pd.to_datetime(wq["datetime"])
-    o2_obs = build(wq[wq["variable"] == "do"], "depth", "observation", mass_convert=True)
-    doc_obs = build(wq[wq["variable"] == "doc"], "depth", "observation", mass_convert=True)
+    wq = load_water_quality_dataframe(data_dir, run_config)
+    if wq is not None:
+        o2_obs = build(wq[wq["variable"] == "do"], "depth", "observation", mass_convert=True)
+        doc_obs = build(wq[wq["variable"] == "doc"], "depth", "observation", mass_convert=True)
+        # POC ("particulate organic carbon") is only present for some
+        # datasets (e.g. Mendota's ME_obs_depths3_wpoc.csv has a "poc" row
+        # per sample; Ravn's L0001-WQ.csv has no such rows at all) -- absent
+        # entirely is the normal case, not an error, so this falls out to
+        # None below exactly like temp/o2/doc do when their own source rows
+        # are missing. Compared against pocr+pocl combined (see extract_pairs/
+        # make_loss_fn), mirroring how doc is compared against docr+docl.
+        poc_obs = build(wq[wq["variable"] == "poc"], "depth", "observation", mass_convert=True)
+    else:
+        o2_obs = doc_obs = poc_obs = None
 
-    return dict(temp=temp_obs, o2=o2_obs, doc=doc_obs)
+    return dict(temp=temp_obs, o2=o2_obs, doc=doc_obs, poc=poc_obs)
 
 
 def obs_weight(obs):
@@ -467,6 +436,10 @@ def extract_pairs(per_step, obs):
         sim = np.asarray(per_step["docr"][obs["doc"]["step_idx"]] + per_step["docl"][obs["doc"]["step_idx"]])
         mask = np.asarray(obs["doc"]["mask"])
         pairs["doc"] = (sim[mask], np.asarray(obs["doc"]["values"])[mask])
+    if obs["poc"] is not None:
+        sim = np.asarray(per_step["pocr"][obs["poc"]["step_idx"]] + per_step["pocl"][obs["poc"]["step_idx"]])
+        mask = np.asarray(obs["poc"]["mask"])
+        pairs["poc"] = (sim[mask], np.asarray(obs["poc"]["values"])[mask])
     return pairs
 
 
@@ -628,6 +601,10 @@ def make_loss_fn(base_params, geometry, forcing, ice_state, init_state, obs, wei
             sim = per_step["docr"][obs["doc"]["step_idx"]] + per_step["docl"][obs["doc"]["step_idx"]]
             err2 = (sim - obs["doc"]["values"]) ** 2 * obs["doc"]["mask"]
             total = total + weights["doc"] * jnp.sum(err2) / jnp.maximum(jnp.sum(obs["doc"]["mask"]), 1.0)
+        if obs["poc"] is not None:
+            sim = per_step["pocr"][obs["poc"]["step_idx"]] + per_step["pocl"][obs["poc"]["step_idx"]]
+            err2 = (sim - obs["poc"]["values"]) ** 2 * obs["poc"]["mask"]
+            total = total + weights["poc"] * jnp.sum(err2) / jnp.maximum(jnp.sum(obs["poc"]["mask"]), 1.0)
         return total
 
     return loss_fn
@@ -657,6 +634,10 @@ def make_per_variable_loss_fn(base_params, geometry, forcing, ice_state, init_st
                 sim = per_step["docr"][obs["doc"]["step_idx"]] + per_step["docl"][obs["doc"]["step_idx"]]
                 err2 = (sim - obs["doc"]["values"]) ** 2 * obs["doc"]["mask"]
                 losses.append(jnp.sum(err2) / jnp.maximum(jnp.sum(obs["doc"]["mask"]), 1.0))
+            elif name == "poc":
+                sim = per_step["pocr"][obs["poc"]["step_idx"]] + per_step["pocl"][obs["poc"]["step_idx"]]
+                err2 = (sim - obs["poc"]["values"]) ** 2 * obs["poc"]["mask"]
+                losses.append(jnp.sum(err2) / jnp.maximum(jnp.sum(obs["poc"]["mask"]), 1.0))
         return jnp.stack(losses)
 
     return fn
@@ -690,7 +671,7 @@ def main():
                               "(only used with --select-mode combined)")
     parser.add_argument("--topk-per-variable", type=int, default=DEFAULT_TOPK_PER_VARIABLE,
                          help="number of parameters to take from EACH variable's own sensitivity "
-                              "ranking (temp/o2/doc); the union across present variables is "
+                              "ranking (temp/o2/doc/poc); the union across present variables is "
                               "calibrated (default select mode -- see --select-mode)")
     parser.add_argument("--select-mode", choices=["per-variable", "combined"], default="per-variable",
                          help="'per-variable' (default): calibrate the union of each present "
@@ -701,9 +682,10 @@ def main():
                          help="comma-separated parameter names to calibrate directly, "
                               "bypassing the sensitivity screen")
     parser.add_argument("--variables", type=str, default=None,
-                         help="comma-separated subset of temp,o2,doc to calibrate against "
-                              "(default: all of temp/o2/doc that have observations in the "
-                              "window). Excluded variables are dropped from the loss and "
+                         help="comma-separated subset of temp,o2,doc,poc to calibrate against "
+                              "(default: all of temp/o2/doc/poc that have observations in the "
+                              "window -- poc only if the configured wq_ini_file has 'poc' rows). "
+                              "Excluded variables are dropped from the loss and "
                               "sensitivity screens entirely, but still reported in the final "
                               "evaluation metrics for reference.")
     parser.add_argument("--sensitivity-only", action="store_true",
@@ -720,7 +702,7 @@ def main():
     windfactor = float(lake_config["WindSpeed"])
     nx = int(run_config["nx"]); dt = float(run_config["dt"]); dx = float(run_config["dx"])
     area, depth, volume, hypso_weight = get_hypsography(
-        "./lake_bathymetry.csv", dx=dx, nx=nx, outflow_depth=float(lake_config["outflow_depth"]),
+        hypsofile=run_config["hypso_ini_file"], dx=dx, nx=nx, outflow_depth=float(lake_config["outflow_depth"]),
     )
 
     desired_start = pd.Timestamp(run_config["start_time"])
@@ -774,19 +756,19 @@ def main():
     print(f"Loading observations and restricting to the {n_steps}-step "
           f"({n_steps * dt / 86400:.0f}-day) simulation window "
           f"({n_chunks} chunk(s) of up to {args.chunk_steps} steps for gradient truncation)...")
-    obs = load_observations("./", depth, volume, desired_start, step_times, dt)
-    for name in ("temp", "o2", "doc"):
+    obs = load_observations("./", depth, volume, desired_start, step_times, dt, run_config=run_config)
+    for name in ("temp", "o2", "doc", "poc"):
         n = int(obs[name]["step_idx"].shape[0]) if obs[name] is not None else 0
         print(f"  {name}: {n} profile date(s) in window")
-    weights = {name: obs_weight(obs[name]) for name in ("temp", "o2", "doc")}
+    weights = {name: obs_weight(obs[name]) for name in ("temp", "o2", "doc", "poc")}
 
-    present_vars = [name for name in ("temp", "o2", "doc") if obs[name] is not None]
+    present_vars = [name for name in ("temp", "o2", "doc", "poc") if obs[name] is not None]
 
     if args.variables:
         requested = [v.strip() for v in args.variables.split(",") if v.strip()]
-        unknown = [v for v in requested if v not in ("temp", "o2", "doc")]
+        unknown = [v for v in requested if v not in ("temp", "o2", "doc", "poc")]
         if unknown:
-            raise SystemExit(f"--variables entries must be from temp,o2,doc: unknown {unknown}")
+            raise SystemExit(f"--variables entries must be from temp,o2,doc,poc: unknown {unknown}")
         missing = [v for v in requested if v not in present_vars]
         if missing:
             raise SystemExit(
@@ -794,8 +776,8 @@ def main():
                 f"{missing} in this {n_steps}-step window -- nothing to calibrate against "
                 "for them. Try a different --steps window, or drop them from --variables."
             )
-        # canonical temp/o2/doc order regardless of how the user typed --variables
-        active_vars = [name for name in ("temp", "o2", "doc") if name in requested]
+        # canonical temp/o2/doc/poc order regardless of how the user typed --variables
+        active_vars = [name for name in ("temp", "o2", "doc", "poc") if name in requested]
     else:
         active_vars = present_vars
 
@@ -815,7 +797,7 @@ def main():
     # is still used for the final evaluation metrics, so an excluded
     # variable is still reported (for reference) even though it never
     # contributed a gradient.
-    obs_for_loss = {name: (obs[name] if name in active_vars else None) for name in ("temp", "o2", "doc")}
+    obs_for_loss = {name: (obs[name] if name in active_vars else None) for name in ("temp", "o2", "doc", "poc")}
 
     loss_fn = make_loss_fn(base_params, geometry, forcing, ice_state, init_state, obs_for_loss, weights, args.chunk_steps)
 

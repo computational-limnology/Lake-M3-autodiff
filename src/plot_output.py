@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 import pickle
 
@@ -7,6 +6,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import Normalize
+
+from observation_data import load_run_config, load_temperature_dataframe, load_water_quality_dataframe
 
 
 def to_numpy(arr):
@@ -104,61 +105,22 @@ def _build_time_labels(time_values, start_time=None):
         return tick_idx, tick_labels
 
 
-def _load_buoy_temperature_observations(
-    result_dir,
-    json_files=("ravn_2023.json", "ravn_2024.json"),
-    sensor_file="sensor_level_buoy.sen",
-):
-    """Load the high-frequency buoy thermistor-chain record from the raw
-    JSON exports (`ravn_2023.json`/`ravn_2024.json`), if present in
-    `result_dir`, average it down to hourly values, and reshape it to the
-    same long-format schema as `L0001-HD.csv`. See
-    `calibrate_M3_jax.load_buoy_temperature()` for the JSON schema and
-    resampling details (kept in sync with this copy). Returns `None` if
-    `sensor_file` or none of `json_files` are present."""
-    sensor_path = os.path.join(result_dir, sensor_file)
-    if not os.path.exists(sensor_path):
-        return None
-    sensors = pd.read_csv(sensor_path, sep=r"\s+")
-    depth_by_sensor = dict(zip(sensors["sensor"].astype(int), sensors["position"].astype(float)))
-
-    hourly_frames = []
-    for json_file in json_files:
-        json_path = os.path.join(result_dir, json_file)
-        if not os.path.exists(json_path):
-            continue
-        with open(json_path) as f:
-            payload = json.load(f)
-        readings = payload["data"]["tempCableReadings"]
-        sensor_cols = [k for k in readings if k != "timestamps"]
-        wide = pd.DataFrame(
-            {col: readings[col] for col in sensor_cols},
-            index=pd.to_datetime(np.asarray(readings["timestamps"], dtype="int64"), unit="s"),
-        ).sort_index()
-        hourly_frames.append(wide.resample("1h").mean())
-
-    if not hourly_frames:
-        return None
-
-    hourly = pd.concat(hourly_frames).sort_index()
-    hourly = hourly[~hourly.index.duplicated(keep="first")]
-    hourly.index.name = "datetime"
-
-    long = hourly.reset_index().melt(
-        id_vars="datetime", var_name="sensor", value_name="Water_Temperature_celsius"
-    )
-    long["Depth_meter"] = long["sensor"].str[1:].astype(int).map(depth_by_sensor)
-    long = long.dropna(subset=["Depth_meter", "Water_Temperature_celsius"])
-    return long[["datetime", "Depth_meter", "Water_Temperature_celsius"]]
-
-
 def _load_temperature_observations(result_path, observations_path=None):
+    """Temperature observations for plotting: `observations_path` if given
+    (an explicit `--observations` override), else `run_config.csv`'s
+    `u_ini_file` (falling back to `L0001-HD.csv`) via
+    `observation_data.load_temperature_dataframe()` -- the same source
+    `calibrate_M3_jax.py` trains/calibrates against. If the high-frequency
+    buoy thermistor-chain record should be included, run
+    `integrate_buoy_temperature.py` once first to fold it into `u_ini_file`
+    directly; this function no longer merges it in separately (it used to,
+    via its own copy of that logic, which is how `u_ini_file` ends up with
+    everything already merged in the first place)."""
     result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
-    if observations_path is None:
-        observations_path = os.path.join(result_dir, "L0001-HD.csv")
 
-    observations = None
-    if os.path.exists(observations_path):
+    if observations_path is not None:
+        if not os.path.exists(observations_path):
+            return None
         observations = pd.read_csv(observations_path)
         required = {"datetime", "Depth_meter", "Water_Temperature_celsius"}
         missing = required.difference(observations.columns)
@@ -168,12 +130,9 @@ def _load_temperature_observations(result_path, observations_path=None):
             )
         observations["datetime"] = pd.to_datetime(observations["datetime"])
         observations = observations[["datetime", "Depth_meter", "Water_Temperature_celsius"]]
-
-    buoy = _load_buoy_temperature_observations(result_dir)
-    if buoy is not None:
-        observations = buoy if observations is None else pd.concat(
-            [observations, buoy], ignore_index=True
-        )
+    else:
+        run_config = load_run_config(result_dir)
+        observations = load_temperature_dataframe(result_dir, run_config)
 
     if observations is None:
         return None
@@ -182,14 +141,25 @@ def _load_temperature_observations(result_path, observations_path=None):
 
 
 def _load_water_quality_observations(result_path, observations_path=None):
-    if observations_path is None:
-        result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
-        observations_path = os.path.join(result_dir, "L0001-WQ.csv")
+    """Dissolved-oxygen/DOC/POC observations for plotting: `observations_path`
+    if given (an explicit `--water-quality-observations` override), else
+    `run_config.csv`'s `wq_ini_file` (falling back to `L0001-WQ.csv`) via
+    `observation_data.load_water_quality_dataframe()`. 'poc' is compared
+    against the model's combined `pocr + pocl` the same way 'doc' is
+    compared against `docr + docl` -- the observation files in this
+    project don't distinguish refractory vs. labile POC, only total POC."""
+    result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
 
-    if not os.path.exists(observations_path):
-        return {}
+    if observations_path is not None:
+        if not os.path.exists(observations_path):
+            return {}
+        observations = pd.read_csv(observations_path)
+    else:
+        run_config = load_run_config(result_dir)
+        observations = load_water_quality_dataframe(result_dir, run_config)
+        if observations is None:
+            return {}
 
-    observations = pd.read_csv(observations_path)
     required = {"datetime", "depth", "observation", "variable"}
     missing = required.difference(observations.columns)
     if missing:
@@ -203,7 +173,7 @@ def _load_water_quality_observations(result_path, observations_path=None):
         variable: observations[observations["variable"] == variable].rename(
             columns={"depth": "Depth_meter", "observation": "value"}
         )
-        for variable in ("do", "doc")
+        for variable in ("do", "doc", "poc")
     }
 
 
@@ -249,8 +219,16 @@ def _select_temperature_depths(observations, depths=None):
     deepest depth that has data in every year the shallowest depth does.
     If `depths` is given (a 2-tuple/list of (upper, lower) depths in
     meters, e.g. from `--depths 1,30`), each requested value is instead
-    snapped to the nearest depth actually present in `observations`."""
+    snapped to the nearest depth actually present in `observations`. If
+    only one depth is observed at all (e.g. a single-sensor high-frequency
+    series with no companion deep profile -- Mendota's 'poc' record is
+    entirely at 1 m, for instance), that same depth is used for both
+    panels rather than returning `None`, so there's still something to
+    plot."""
     observed_depths = np.sort(observations["Depth_meter"].unique())
+
+    if len(observed_depths) == 1:
+        return float(observed_depths[0]), float(observed_depths[0])
 
     if depths is not None:
         upper_requested, lower_requested = depths
@@ -262,22 +240,42 @@ def _select_temperature_depths(observations, depths=None):
     upper_observations = observations[observations["Depth_meter"] == shallowest_depth]
     upper_years = set(upper_observations["datetime"].dt.year)
 
-    eligible_lower_depths = [
-        depth
-        for depth in observed_depths[1:]
-        if upper_years.issubset(
-            set(
-                observations[observations["Depth_meter"] == depth]
-                .groupby(observations["datetime"].dt.year)
-                .size()
-                .loc[lambda counts: counts >= 2]
-                .index
-            )
+    def years_with_profiles(depth):
+        counts = (
+            observations[observations["Depth_meter"] == depth]
+            .groupby(observations["datetime"].dt.year)
+            .size()
         )
+        return set(counts.loc[lambda c: c >= 2].index)
+
+    eligible_lower_depths = [
+        depth for depth in observed_depths[1:] if upper_years.issubset(years_with_profiles(depth))
     ]
-    if not eligible_lower_depths:
+    if eligible_lower_depths:
+        return shallowest_depth, eligible_lower_depths[-1]
+
+    # Strict fallback found nothing -- this happens whenever the modeled
+    # window doesn't fully span every calendar year the shallow depth has
+    # data in (e.g. a short window, or one that starts/ends mid-year), even
+    # if a perfectly usable deep comparison depth exists for the years that
+    # *do* overlap. Rather than silently returning no plot at all, fall
+    # back to the deepest depth with the most year-overlap with the
+    # shallow depth, so there's always a best-effort default; pass
+    # `--depths` explicitly to pick specific depths instead.
+    overlap_counts = [
+        (depth, len(upper_years & years_with_profiles(depth))) for depth in observed_depths[1:]
+    ]
+    overlap_counts = [(depth, n) for depth, n in overlap_counts if n > 0]
+    if not overlap_counts:
         return None
-    return shallowest_depth, eligible_lower_depths[-1]
+    max_overlap = max(n for _, n in overlap_counts)
+    best_depth = [depth for depth, n in overlap_counts if n == max_overlap][-1]
+    print(
+        f"  note: no depth has profile data in every year {shallowest_depth:g} m does within the "
+        f"modeled period -- falling back to {best_depth:g} m (best year-overlap); pass --depths to "
+        "choose explicitly."
+    )
+    return shallowest_depth, best_depth
 
 
 def _filter_to_modeled_period(observations, time_values, start_time):
@@ -621,6 +619,20 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
                 start_time,
                 depths=depths,
             )
+        pocr = arrays.get("pocr")
+        pocl = arrays.get("pocl")
+        if pocr is not None and pocl is not None:
+            _plot_observed_series(
+                pocr + pocl,
+                time_values,
+                depth_values,
+                water_quality_observations.get("poc"),
+                "value",
+                "Particulate organic carbon",
+                "POC (mg/L)",
+                start_time,
+                depths=depths,
+            )
     plt.show()
 
 
@@ -629,11 +641,13 @@ def main():
     parser.add_argument("path", help="Path to a result directory, .pkl file, or .npz file.")
     parser.add_argument(
         "--observations",
-        help="Optional path to L0001-HD.csv; by default it is looked up beside the result.",
+        help="Optional explicit path to a temperature observations CSV; by default it is read "
+        "from run_config.csv's u_ini_file, looked up beside the result.",
     )
     parser.add_argument(
         "--water-quality-observations",
-        help="Optional path to L0001-WQ.csv; by default it is looked up beside the result.",
+        help="Optional explicit path to a water-quality observations CSV; by default it is read "
+        "from run_config.csv's wq_ini_file, looked up beside the result.",
     )
     parser.add_argument(
         "--depths",

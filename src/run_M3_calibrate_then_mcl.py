@@ -6,11 +6,19 @@ Sequential pipeline: gradient-based physical-parameter calibration
 trains its correction on top of the newly calibrated physics rather than
 whatever was on disk before.
 
+Both stages read observed data generically from `run_config.csv`'s
+`u_ini_file`/`wq_ini_file` (via `src/observation_data.py`). If a dataset
+has a high-frequency buoy thermistor-chain record (e.g. Ravn's
+`ravn_2023.json`/`ravn_2024.json` + `sensor_level_buoy.sen`) that should be
+included, run `python src/integrate_buoy_temperature.py <data_dir>` once
+beforehand to fold it into `u_ini_file` -- this wrapper does not do that
+merge itself.
+
 Usage:
     python src/run_M3_calibrate_then_mcl.py Ravn --params Cd,at_factor
         [--cal-steps N] [--cal-chunk-steps N] [--cal-iters K] [--cal-lr LR]
         [--cal-early-stop-patience N] [--cal-early-stop-tol TOL]
-        [--cal-variables temp,o2,doc]
+        [--cal-variables temp,o2,doc,poc]
         [--mcl-target {kz,ri}]
         [--hidden-size H] [--depth-basis-degree D] [--kz-reg LAMBDA]
         [--ri-k0-init K0] [--ri-alpha-init A] [--ri-n-init N] [--ri-memory-hours H]
@@ -229,8 +237,9 @@ def main():
     cal.add_argument("--cal-select-mode", choices=["per-variable", "combined"], default="per-variable",
                       help="only used when --params is omitted")
     cal.add_argument("--cal-variables", type=str, default=None,
-                      help="comma-separated subset of temp,o2,doc to calibrate against "
-                           "(default: all with observations in the window)")
+                      help="comma-separated subset of temp,o2,doc,poc to calibrate against "
+                           "(default: all with observations in the window -- poc only if the "
+                           "dataset's wq_ini_file has 'poc' rows)")
 
     mcl = parser.add_argument_group("mcl stage (run_M3_mcl_jax.py)")
     mcl.add_argument("--mcl-steps", type=int, default=None,
