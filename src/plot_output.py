@@ -291,6 +291,113 @@ def _filter_to_modeled_period(observations, time_values, start_time):
     )
 
 
+def _match_model_to_observations(model_data, depth_values, model_datetimes, observations, value_column):
+    """Nearest-neighbor match: each observation row is paired with the
+    model's nearest depth level and nearest timestamp. Returns
+    `(observed_values, modeled_values)` as plain numpy arrays, one entry
+    per row of `observations`. Shared by the modeled-vs-observed scatter
+    panel in `_plot_observed_series` and by the performance-metrics table
+    (`_compute_metrics`/`_print_metrics_table`) below."""
+    scatter_depths = observations["Depth_meter"].to_numpy(dtype=float)
+    model_indices = np.abs(depth_values[:, None] - scatter_depths[None, :]).argmin(axis=0)
+    observed_times = pd.DatetimeIndex(observations["datetime"])
+    right_idx = np.searchsorted(model_datetimes, observed_times)
+    right_idx = np.clip(right_idx, 0, len(model_datetimes) - 1)
+    left_idx = np.maximum(right_idx - 1, 0)
+    right_distance = np.abs(model_datetimes[right_idx] - observed_times)
+    left_distance = np.abs(model_datetimes[left_idx] - observed_times)
+    nearest_idx = np.where(right_distance < left_distance, right_idx, left_idx)
+    observed_values = observations[value_column].to_numpy(dtype=float)
+    modeled_values = model_data[nearest_idx, model_indices]
+    return observed_values, modeled_values
+
+
+def _rmse(sim, obs):
+    return float(np.sqrt(np.mean((sim - obs) ** 2)))
+
+
+def _r2(sim, obs):
+    """Squared Pearson correlation coefficient -- the "goodness of fit"
+    sense of R^2, distinct from NSE below (which also penalizes bias and
+    scale errors, not just correlation). Same formula calibrate_M3_jax.py
+    uses for its own evaluation metrics."""
+    if len(obs) < 2 or np.std(obs) < 1e-12 or np.std(sim) < 1e-12:
+        return float("nan")
+    r = np.corrcoef(sim, obs)[0, 1]
+    return float(r ** 2)
+
+
+def _nse(sim, obs):
+    """Nash-Sutcliffe Efficiency: 1 - SS_res/SS_tot. 1 = perfect,
+    0 = no better than predicting the observed mean, <0 = worse."""
+    denom = np.sum((obs - np.mean(obs)) ** 2)
+    if denom < 1e-12:
+        return float("nan")
+    return float(1 - np.sum((obs - sim) ** 2) / denom)
+
+
+def _kge(sim, obs):
+    """Kling-Gupta Efficiency: 1 - sqrt((r-1)^2 + (alpha-1)^2 + (beta-1)^2),
+    with alpha = std(sim)/std(obs) (variability ratio) and
+    beta = mean(sim)/mean(obs) (bias ratio). 1 = perfect."""
+    if np.std(obs) < 1e-12 or abs(np.mean(obs)) < 1e-12:
+        return float("nan")
+    r = np.corrcoef(sim, obs)[0, 1]
+    alpha = np.std(sim) / np.std(obs)
+    beta = np.mean(sim) / np.mean(obs)
+    return float(1 - np.sqrt((r - 1) ** 2 + (alpha - 1) ** 2 + (beta - 1) ** 2))
+
+
+def _compute_metrics(model_data, time_values, depth_values, observations, value_column, start_time=None):
+    """RMSE/NSE/KGE/R2 for one variable, in the spirit of
+    `calibrate_M3_jax.py`'s `compute_metrics`/`extract_pairs` -- same four
+    metrics, same formulas -- but matched by nearest-neighbor time & depth
+    (`_match_model_to_observations`) rather than by an exact simulation
+    step index, since this script works from an already-run result file
+    rather than re-simulating at each observation's own step. Observations
+    are first restricted to the modeled period (`_filter_to_modeled_period`),
+    exactly like the scatter panel does. Returns `None` if there's nothing
+    to score (no observations, no depth/time information to match against,
+    or every matched pair is non-finite)."""
+    if observations is None or observations.empty:
+        return None
+    if depth_values is None or depth_values.ndim != 1 or depth_values.size != model_data.shape[1]:
+        return None
+
+    observations, model_datetimes = _filter_to_modeled_period(observations, time_values, start_time)
+    if observations.empty or model_datetimes is None:
+        return None
+
+    observed_values, modeled_values = _match_model_to_observations(
+        model_data, depth_values, model_datetimes, observations, value_column,
+    )
+    finite = np.isfinite(observed_values) & np.isfinite(modeled_values)
+    if not finite.any():
+        return None
+    sim = modeled_values[finite]
+    obs = observed_values[finite]
+    return dict(
+        n=int(finite.sum()), rmse=_rmse(sim, obs), nse=_nse(sim, obs),
+        kge=_kge(sim, obs), r2=_r2(sim, obs),
+    )
+
+
+def _print_metrics_table(metrics):
+    """Print RMSE/NSE/KGE/R2 for every variable with a non-`None` entry in
+    `metrics` (a dict of variable name -> `_compute_metrics()` result, or
+    `None` if that variable had nothing to score), in the same table style
+    `calibrate_M3_jax.py`'s `print_metrics_table` uses."""
+    scored = {name: m for name, m in metrics.items() if m is not None}
+    if not scored:
+        print("\nNo observations available to compute performance metrics against.")
+        return
+    print("\nPerformance metrics (modeled vs. observed, nearest-neighbor matched in time & depth; "
+          "NSE/KGE/R2: 1.0 = perfect fit):")
+    print(f"  {'variable':10s} {'n':>6s} {'RMSE':>12s} {'NSE':>8s} {'KGE':>8s} {'R2':>8s}")
+    for name, m in scored.items():
+        print(f"  {name:10s} {m['n']:6d} {m['rmse']:12.4g} {m['nse']:8.3f} {m['kge']:8.3f} {m['r2']:8.3f}")
+
+
 def _plot_observed_series(
     model_data,
     time_values,
@@ -354,19 +461,10 @@ def _plot_observed_series(
     scatter = None
     scatter_values = []
     if model_datetimes is not None:
+        observed_values, modeled_values = _match_model_to_observations(
+            model_data, depth_values, model_datetimes, observations, value_column,
+        )
         scatter_depths = observations["Depth_meter"].to_numpy(dtype=float)
-        scatter_model_indices = np.abs(
-            depth_values[:, None] - scatter_depths[None, :]
-        ).argmin(axis=0)
-        observed_times = pd.DatetimeIndex(observations["datetime"])
-        right_idx = np.searchsorted(model_datetimes, observed_times)
-        right_idx = np.clip(right_idx, 0, len(model_datetimes) - 1)
-        left_idx = np.maximum(right_idx - 1, 0)
-        right_distance = np.abs(model_datetimes[right_idx] - observed_times)
-        left_distance = np.abs(model_datetimes[left_idx] - observed_times)
-        nearest_idx = np.where(right_distance < left_distance, right_idx, left_idx)
-        observed_values = observations[value_column].to_numpy(dtype=float)
-        modeled_values = model_data[nearest_idx, scatter_model_indices]
         depth_min = scatter_depths.min()
         depth_max = scatter_depths.max()
         depth_norm = Normalize(
@@ -591,6 +689,40 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
     water_quality_observations = _load_water_quality_observations(
         path, water_quality_observations_path
     )
+
+    # --- performance metrics (RMSE/NSE/KGE/R2), all variables with observations ---
+    # Mirrors calibrate_M3_jax.py's evaluation-metrics table (same four
+    # metrics/formulas -- see _rmse/_nse/_kge/_r2 above), computed here
+    # against this already-run result file rather than a fresh simulation.
+    # O2/DOC/POC are compared in concentration units (`arrays`, mass/volume)
+    # against the mg/L observations, same units the plots above use; this
+    # needs `volume` (see the `if volume is not None` guard below), which
+    # is why those three are conditioned on it while temperature isn't.
+    metrics = {"temp": _compute_metrics(temp, time_values, depth_values, observations,
+                                         "Water_Temperature_celsius", start_time)}
+    if volume is not None and volume.size == n_depth:
+        o2 = arrays.get("o2")
+        docr = arrays.get("docr")
+        docl = arrays.get("docl")
+        pocr = arrays.get("pocr")
+        pocl = arrays.get("pocl")
+        if o2 is not None:
+            metrics["o2"] = _compute_metrics(
+                o2, time_values, depth_values, water_quality_observations.get("do"),
+                "value", start_time,
+            )
+        if docr is not None and docl is not None:
+            metrics["doc"] = _compute_metrics(
+                docr + docl, time_values, depth_values, water_quality_observations.get("doc"),
+                "value", start_time,
+            )
+        if pocr is not None and pocl is not None:
+            metrics["poc"] = _compute_metrics(
+                pocr + pocl, time_values, depth_values, water_quality_observations.get("poc"),
+                "value", start_time,
+            )
+    _print_metrics_table(metrics)
+
     if volume is not None and volume.size == n_depth:
         o2 = arrays.get("o2")
         docr = arrays.get("docr")
