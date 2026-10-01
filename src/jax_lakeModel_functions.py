@@ -1058,22 +1058,40 @@ def _prodcons_pd_matrices(y, consumption, npp, resp, beta):
     return p, d
 
 
-def _prodcons_single_layer(y0, u_i, volume_i, area_i, H_i, TP, dt, theta_r, k_half, theta_npp, resp, beta,
-                            sw_to_par):
-    y0 = jnp.stack(y0)
-
-    o2c = y0[0] / volume_i
-    consumption = theta_r ** (u_i - 20) * o2c / (k_half + o2c)
-
-    PAR = H_i * sw_to_par / 1e6  # mol/m2/s
+def compute_npp(u, area, H, TP, theta_npp, sw_to_par=2.114):
+    """Depth-resolved net primary production (same units `npp` has inside
+    `_prodcons_pd_matrices`/`_prodcons_single_layer` -- mol C/s, before the
+    `86400 s/day * 12.0 g/mol` conversion `prodcons_step`'s own
+    `npp_production` diagnostic applies), computed directly over the full
+    depth array *before* `prodcons_step()` is called, instead of being
+    recomputed per-layer inside its vmapped body. This mirrors the
+    "compute once outside, then feed the result in" pattern
+    `eddy_diffusivity_hendersonSellers()` already uses for `kz` before
+    `diffusion_step_wq()`/`poc_settling_step()` (see `full_step()` step 7
+    vs. step 11 below). Matches the light-limited-growth calculation
+    inside `prodcons_module_woDOCL`'s inner `fun()`
+    (`processBased_lakeModel_functions.py`, untouched reference) exactly --
+    same constants, same formula -- just lifted out of
+    `_prodcons_single_layer` so it no longer needs `area`/`H`/`TP`/
+    `theta_npp`/`sw_to_par` passed through it at all."""
+    PAR = H * sw_to_par / 1e6  # mol/m2/s
     P_max = 1.5e-6  # mol C/m2/s
     alpha_P = 0.03
     LIGHTUSEBYPHOTOS = 0.3  # matches the reference's hardcoded shadow of the caller's value
     P_I = P_max * (1 - jnp.exp(-(alpha_P * LIGHTUSEBYPHOTOS) * PAR / P_max))
     k_TP = 60.0  # 0.06 * 1000
     f_TP = TP / (k_TP + TP)
-    temp_factor = theta_npp ** (u_i - 20)
-    npp = P_I * f_TP * temp_factor * area_i
+    temp_factor = theta_npp ** (u - 20)
+    return P_I * f_TP * temp_factor * area
+
+
+def _prodcons_single_layer(y0, u_i, volume_i, npp_i, dt, theta_r, k_half, resp, beta):
+    y0 = jnp.stack(y0)
+
+    o2c = y0[0] / volume_i
+    consumption = theta_r ** (u_i - 20) * o2c / (k_half + o2c)
+
+    npp = npp_i
 
     eye = jnp.eye(5, dtype=bool)
 
@@ -1102,20 +1120,22 @@ def _prodcons_single_layer(y0, u_i, volume_i, area_i, H_i, TP, dt, theta_r, k_ha
     return y_new, diagnostics
 
 
-def prodcons_step(u, o2, docr, docl, pocr, pocl, area, volume, H, TP, dt, theta_r, k_half, theta_npp, resp,
-                   beta, sw_to_par=2.114):
-    """`resp` = (resp_docr, resp_docl, resp_pocr, resp_pocl). Returns
+def prodcons_step(u, o2, docr, docl, pocr, pocl, volume, npp, dt, theta_r, k_half, resp, beta):
+    """`resp` = (resp_docr, resp_docl, resp_pocr, resp_pocl). `npp` is the
+    depth-resolved net primary production from `compute_npp()`, called
+    *before* this function -- see that function's docstring and
+    `full_step()` -- rather than computed internally here. Returns
     (o2, docr, docl, pocr, pocl, diagnostics_dict). The bottom layer
     (index nx-1) is left unchanged -- see module docstring point 4."""
     nx = u.shape[0]
 
-    def per_layer(o2_i, docr_i, docl_i, pocr_i, pocl_i, u_i, volume_i, area_i, H_i):
+    def per_layer(o2_i, docr_i, docl_i, pocr_i, pocl_i, u_i, volume_i, npp_i):
         return _prodcons_single_layer(
-            (o2_i, docr_i, docl_i, pocr_i, pocl_i), u_i, volume_i, area_i, H_i, TP, dt,
-            theta_r, k_half, theta_npp, resp, beta, sw_to_par,
+            (o2_i, docr_i, docl_i, pocr_i, pocl_i), u_i, volume_i, npp_i, dt,
+            theta_r, k_half, resp, beta,
         )
 
-    y_new, diagnostics = jax.vmap(per_layer)(o2, docr, docl, pocr, pocl, u, volume, area, H)
+    y_new, diagnostics = jax.vmap(per_layer)(o2, docr, docl, pocr, pocl, u, volume, npp)
 
     mask = jnp.arange(nx) < (nx - 1)
     o2_new = jnp.where(mask, y_new[:, 0], o2)
@@ -1274,9 +1294,15 @@ def full_step(state, forcing, geometry, params, kz_override=None):
         ice, IceSnowAttCoeff * forcing["Jsw"] * jnp.exp(-kd_light * depth),
         (1 - albedo) * forcing["Jsw"] * jnp.exp(-kd_light * depth),
     )
+    # Depth-resolved NPP, computed once here (before prodcons_step) rather
+    # than recomputed per-layer inside it -- the same "compute outside,
+    # feed the result in" pattern step 7 above uses for `kz` before
+    # `diffusion_step_wq()`/`poc_settling_step()`. See compute_npp()'s
+    # docstring.
+    npp = compute_npp(u, area, H, forcing["TP"], params["theta_npp"])
     o2, docr, docl, pocr, pocl, diag = prodcons_step(
-        u, o2, docr, docl, pocr, pocl, area, volume, H, forcing["TP"], dt,
-        params["theta_r"], params["k_half"], params["theta_npp"],
+        u, o2, docr, docl, pocr, pocl, volume, npp, dt,
+        params["theta_r"], params["k_half"],
         (params["resp_docr"], params["resp_docl"], params["resp_pocr"], params["resp_pocl"]),
         params["beta"],
     )
@@ -1294,7 +1320,7 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     )
     diagnostics = dict(
         kd_light=kd_light, atm_flux=atm_flux, kz_process=kz_process, ri_process=ri_process,
-        Q_net=Q_net, **diag,
+        Q_net=Q_net, npp=npp, **diag,
     )
     return new_state, diagnostics
 

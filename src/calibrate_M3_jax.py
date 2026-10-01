@@ -271,14 +271,13 @@ DEFAULT_TOPK_PER_VARIABLE = 5
 # concentration column, treating the overall scale of the carbon-loading
 # boundary condition as an unknown to calibrate rather than a fixed input.
 CANDIDATE_PARAMS = [
-    "km", "weight_kz", "Cd", "denThresh",
+    "km", "Cd", "denThresh",
     "kd_light", "light_water", "light_doc", "light_poc",
-    "sw_factor", "at_factor", "turb_factor", "wind_factor", "Hgeo",
+    "sw_factor", "at_factor", "wind_factor", "Hgeo",
     "theta_r", "theta_npp", "k_half",
     "resp_docr", "resp_docl", "resp_pocr", "resp_pocl",
     "settling_rate_labile", "settling_rate_refractory",
-    "f_sod", "d_thick", "meltP", "p2", "eps", "emissivity",
-    "oc_load_factor",
+    "f_sod", "d_thick", "meltP", "oc_load_factor",
 ]
 
 

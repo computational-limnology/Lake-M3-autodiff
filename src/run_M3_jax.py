@@ -1,7 +1,10 @@
 """
-Driver for the JAX lake-model port, mirroring `run_M3.py` but calling
-`run_full_model` (or, with `--temp-only`, the lighter `run_temperature_model`)
-from `jax_lakeModel_functions.py` instead of the numpy `run_wq_model`.
+Driver for the JAX lake-model port, mirroring `run_M3.py` but running
+`full_step` (or, with `--temp-only`, the lighter `temperature_step`) from
+`jax_lakeModel_functions.py` in a `lax.scan` instead of the numpy
+`run_wq_model`. This re-implements the same scan `run_full_model()`/
+`run_temperature_model()` wrap (same per-step physics, same state), chunked
+here instead of a single call -- see `run_with_progress()` below for why.
 
 Data loading (bathymetry, meteorology, lake/model/run config, initial
 profiles, phosphorus/carbon boundary data) reuses the *unchanged*
@@ -20,6 +23,23 @@ you would run `run_M3.py`:
 quick validation runs); omit it to run the full config-specified period.
 `--temp-only` runs just the Phase-1 thermal engine (temperature held
 `kd_light` constant, no O2/DOC/POC state) instead of the full model.
+
+Progress reporting: before the run starts, this prints the simulated date
+range and the number of vertical grid cells (`nx`). While it runs, a tqdm
+progress bar tracks completed hourly steps. Getting a live-updating bar out
+of a `jax.jit`-compiled `lax.scan` isn't possible directly -- the whole scan
+executes as one opaque compiled call, with no way back out to Python until
+it's completely done -- so the run is split into fixed-size chunks
+(`--chunk-steps`, default `DEFAULT_CHUNK_STEPS` below), each one its own
+`lax.scan` wrapped in a single `jax.jit` function that's compiled once (two
+compiles at most: one for the common chunk size, one for a shorter final
+chunk) and reused across chunks via an ordinary Python `for` loop, blocking
+on each chunk's result before advancing the bar -- so the bar reflects
+actual completed compute, not just queued-but-not-yet-run dispatch (`jax.jit`
+dispatches asynchronously). This is the same chunking idea
+`calibrate_M3_jax.py` uses for truncated backprop (see its module
+docstring), just without the gradient-truncation machinery, since this
+script never differentiates through the simulation.
 """
 import argparse
 import os
@@ -29,10 +49,12 @@ from copy import deepcopy
 import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
+from tqdm import tqdm
 
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+from jax import lax
 
 from processBased_lakeModel_functions import (
     get_hypsography, provide_meteorology, initial_profile, wq_initial_profile,
@@ -40,8 +62,11 @@ from processBased_lakeModel_functions import (
     get_ice_and_snow, get_num_data_columns,
 )
 from jax_lakeModel_functions import (
-    run_temperature_model, run_full_model, default_params, default_geometry_wq,
+    make_initial_state, make_initial_state_full, temperature_step, full_step,
+    default_params, default_geometry_wq,
 )
+
+DEFAULT_CHUNK_STEPS = 200
 
 
 def build_forcing_series(daily_meteo, times, wind_factor):
@@ -83,11 +108,67 @@ def add_wq_forcing_series(forcing, phosphorus_data, carbon_data, times):
     return forcing
 
 
+def _make_chunk_bounds(n_steps, chunk_steps):
+    """[(start, end), ...] covering [0, n_steps) in steps of at most
+    `chunk_steps` (the last chunk may be shorter). Same idea as
+    `calibrate_M3_jax.py`'s `make_chunk_bounds`, duplicated here rather
+    than imported since that module pulls in optax/observation_data for
+    calibration-only needs this script has no reason to depend on."""
+    bounds = []
+    start = 0
+    while start < n_steps:
+        end = min(start + chunk_steps, n_steps)
+        bounds.append((start, end))
+        start = end
+    return bounds
+
+
+def run_with_progress(step_fn, state0, forcing_series, geometry, params, output_fields, chunk_steps, desc):
+    """Run `state0` forward through every step of `forcing_series` by
+    repeatedly calling `step_fn(state, forcing_t, geometry, params) ->
+    new_state`, `chunk_steps` steps at a time, with a tqdm bar tracking
+    completed steps -- see the module docstring for why chunking is what
+    makes a live progress bar possible at all here. Returns
+    `(final_state, per_step)` where `per_step` is a dict of numpy arrays
+    (one per name in `output_fields`, each shape (n_steps, nx)), matching
+    what `run_temperature_model()`/`run_full_model()` used to return
+    directly from a single unchunked `lax.scan`."""
+    n_steps = next(iter(forcing_series.values())).shape[0]
+    bounds = _make_chunk_bounds(n_steps, chunk_steps)
+
+    @jax.jit
+    def run_chunk(state, forcing_chunk):
+        def body(s, forcing_t):
+            new_s = step_fn(s, forcing_t, geometry, params)
+            outputs = {name: new_s[name] for name in output_fields}
+            return new_s, outputs
+
+        return lax.scan(body, state, forcing_chunk)
+
+    state = state0
+    collected = {name: [] for name in output_fields}
+    with tqdm(total=n_steps, desc=desc, unit="step") as bar:
+        for start, end in bounds:
+            forcing_chunk = jax.tree_util.tree_map(lambda v: v[start:end], forcing_series)
+            state, outputs = run_chunk(state, forcing_chunk)
+            jax.block_until_ready(outputs)  # pace the bar on real compute, not just async dispatch
+            for name in output_fields:
+                collected[name].append(np.asarray(outputs[name]))
+            bar.update(end - start)
+
+    per_step = {name: np.concatenate(collected[name], axis=0) for name in output_fields}
+    return state, per_step
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("data_dir", nargs="?", default=".")
     parser.add_argument("--steps", type=int, default=None, help="truncate to first N forcing steps")
     parser.add_argument("--temp-only", action="store_true", help="run only the Phase-1 thermal engine")
+    parser.add_argument("--chunk-steps", type=int, default=DEFAULT_CHUNK_STEPS,
+                         help=f"steps per progress-bar update (default {DEFAULT_CHUNK_STEPS}); purely a "
+                              "progress-reporting/compile-granularity knob -- the simulated trajectory "
+                              "is identical regardless of this value (see module docstring)")
     args = parser.parse_args()
 
     os.chdir(args.data_dir)
@@ -129,6 +210,14 @@ def main():
     if args.steps is not None:
         step_times = step_times[: args.steps]
 
+    simulated_end = startingDate + pd.Timedelta(seconds=float(step_times[-1]))
+    lake_name = str(lake_config.name) if lake_config.name is not None else None
+    print(
+        f"Simulating {lake_name + ' ' if lake_name else ''}"
+        f"from {startingDate:%Y-%m-%d %H:%M} to {simulated_end:%Y-%m-%d %H:%M} "
+        f"({len(step_times)} hourly steps, nx={nx} vertical grid cells)"
+    )
+
     forcing = build_forcing_series(meteo_all, step_times, windfactor)
 
     geometry = dict(
@@ -153,17 +242,18 @@ def main():
     u0 = jnp.asarray(deepcopy(u_ini), dtype=jnp.float64)
 
     if args.temp_only:
-        run_fn = jax.jit(lambda u0: run_temperature_model(u0, forcing, geometry, params, ice_state=ice_state))
+        state0 = make_initial_state(u0, nx, **ice_state)
 
-        print(f"Running JAX thermal engine (temp-only) for {len(step_times)} steps (nx={nx})...")
         t0 = time.time()
-        final_state, u_all = run_fn(u0)
-        u_all.block_until_ready()
+        final_state, per_step = run_with_progress(
+            temperature_step, state0, forcing, geometry, params, ["u"], args.chunk_steps,
+            desc="Thermal engine",
+        )
         t1 = time.time()
         print(f"Done in {t1 - t0:.2f} s ({(t1 - t0) / len(step_times) * 1000:.3f} ms/step)")
 
         out_path = os.path.join(os.getcwd(), "res_lake1_jax_temp.npz")
-        np.savez(out_path, temp=np.asarray(u_all), times=step_times, depth=np.asarray(depth))
+        np.savez(out_path, temp=per_step["u"], times=step_times, depth=np.asarray(depth))
         print(f"Saved temperature output to {out_path}")
         return
 
@@ -195,22 +285,29 @@ def main():
     pocr_0 = jnp.asarray(0.5 * volume, dtype=jnp.float64)
     pocl_0 = jnp.asarray(0.5 * volume, dtype=jnp.float64)
 
-    run_fn = jax.jit(lambda u0: run_full_model(
-        u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, forcing, geometry, params, ice_state=ice_state,
-    ))
+    state0 = make_initial_state_full(u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, nx, **ice_state)
 
-    print(f"Running full JAX lake model (temp + WQ) for {len(step_times)} steps (nx={nx})...")
+    # full_step() returns (new_state, diagnostics); run_with_progress()'s
+    # step_fn contract (shared with temperature_step(), which returns just
+    # new_state) only wants the state.
+    def full_step_fn(state, forcing_t, geometry, params):
+        new_state, _ = full_step(state, forcing_t, geometry, params)
+        return new_state
+
     t0 = time.time()
-    final_state, per_step = run_fn(u0)
-    per_step["u"].block_until_ready()
+    final_state, per_step = run_with_progress(
+        full_step_fn, state0, forcing, geometry, params,
+        ["u", "o2", "docr", "docl", "pocr", "pocl"], args.chunk_steps,
+        desc="Lake model",
+    )
     t1 = time.time()
     print(f"Done in {t1 - t0:.2f} s ({(t1 - t0) / len(step_times) * 1000:.3f} ms/step)")
 
     out_path = os.path.join(os.getcwd(), "res_lake1_jax_full.npz")
     np.savez(
         out_path,
-        temp=np.asarray(per_step["u"]), o2=np.asarray(per_step["o2"]), docr=np.asarray(per_step["docr"]),
-        docl=np.asarray(per_step["docl"]), pocr=np.asarray(per_step["pocr"]), pocl=np.asarray(per_step["pocl"]),
+        temp=per_step["u"], o2=per_step["o2"], docr=per_step["docr"],
+        docl=per_step["docl"], pocr=per_step["pocr"], pocl=per_step["pocl"],
         times=step_times, depth=np.asarray(depth), volume=np.asarray(volume),
     )
     print(f"Saved results to {out_path}")
