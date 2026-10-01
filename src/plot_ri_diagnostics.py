@@ -1,10 +1,13 @@
 """
 Plot the `--target ri` fit's learned Munk-Anderson stability parameters
 (alpha, n) alongside a handful of physical drivers, from a
-`run_M3_mcl_jax.py --target ri` result (`mcl_result.npz`).
+`train_M3_mcl_jax.py --target ri` result (`mcl_result.npz`; `run_M3_mcl_jax.py`'s
+own `res_lake1_mcl_hybrid.npz` also has these fields under slightly
+different key names -- see that script's module docstring -- but this plot
+expects train_M3_mcl_jax.py's own `_hybrid`-suffixed schema).
 
 Six stacked, shared-time-axis panels:
-  1. alpha  (log scale -- see run_M3_mcl_jax.py's DEFAULT_RI_MEMORY_HOURS
+  1. alpha  (log scale -- see train_M3_mcl_jax.py's DEFAULT_RI_MEMORY_HOURS
      comment for what smooths this series: an explicit couple-hour EMA
      memory on the LSTM's raw per-step output, --ri-memory-hours).
   2. n
@@ -57,7 +60,7 @@ def main():
     if missing:
         raise SystemExit(
             f"{args.result_path} is missing {missing} -- this plot needs a mcl_result.npz produced "
-            "with `run_M3_mcl_jax.py --target ri` (or the wrapper's --mcl-target ri), not --target kz "
+            "with `train_M3_mcl_jax.py --target ri` (or the wrapper's --mcl-target ri), not --target kz "
             "(the default). Re-run the mcl stage with --target ri / --mcl-target ri first."
         )
 

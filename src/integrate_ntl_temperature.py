@@ -3,7 +3,7 @@ Merge Mendota's high-frequency buoy thermistor-chain temperature record
 (`ntl130_2_v14.csv`, NTL-LTER data package 130) into the manual-profile
 temperature file `run_config.csv`'s `u_ini_file` names (`observedTemp.txt`
 for Mendota), so that every script in this project that reads temperature
-observations -- `calibrate_M3_jax.py`, `run_M3_mcl_jax.py`,
+observations -- `calibrate_M3_jax.py`, `train_M3_mcl_jax.py`,
 `plot_output.py`, `plot_mcl_kz.py`, `plot_ri_diagnostics.py`, and
 `run_M3_calibrate_then_mcl.py` (which just runs the first two) -- gets ALL
 of it (the sparse manual profiles AND the dense buoy record) by simply

@@ -387,7 +387,7 @@ def eddy_diffusivity_hendersonSellers(rho, depth, g, rho_0, ice, Uw, latitude, T
     if return_ri:
         # `Ri` is always >= 0 by construction (`buoy` is floored above 0, so
         # the sqrt argument is always >= 1) -- a depth-resolved Richardson
-        # number `run_M3_mcl_jax.py` can optionally fit its own stability
+        # number `train_M3_mcl_jax.py` can optionally fit its own stability
         # function against (`kz = K0*(1+alpha*Ri)**(-n)`, the classical
         # Munk-Anderson form) instead of directly correcting this
         # function's own `kz` output. Not part of the default return value
@@ -440,7 +440,7 @@ def heating_module(
     # with depth via Beer-Lambert attenuation for the actual heating below.
     # Not used elsewhere in the physics -- purely a diagnostic passed up
     # through `full_step`'s returned dict for external analysis/plotting
-    # (see run_M3_mcl_jax.py's --target ri diagnostics).
+    # (see train_M3_mcl_jax.py's/run_M3_mcl_jax.py's --target ri diagnostics).
     Q_net = Q + (1 - albedo) * Jsw_eff
 
     return u_new, IceSnowAttCoeff, Q_net
@@ -1029,6 +1029,12 @@ def poc_settling_step(pocr, pocl, kz, settling_rate_refractory, settling_rate_la
 # ---------------------------------------------------------------------------
 
 _PRODCONS_EPS = 1e-12
+# Bounds the backward-only derivative `_safe_reciprocal` computes (see that
+# function's docstring) -- large enough to never bind for any concentration
+# magnitude this model actually produces in its forward pass (`1/v` itself
+# would already be enormous well before `-1/v**2` reaches this), but finite
+# so it can never itself be `inf`.
+_PRODCONS_GRAD_DERIV_MAX = 1e150
 
 
 def _prodcons_pd_matrices(y, consumption, npp, resp, beta):
@@ -1085,6 +1091,62 @@ def compute_npp(u, area, H, TP, theta_npp, sw_to_par=2.114):
     return P_I * f_TP * temp_factor * area
 
 
+@jax.custom_jvp
+def _safe_div(a, b):
+    """`a / b`, forward-identical to a plain division -- bit-exact with the
+    reference model and with every other caller of plain division, since
+    the primal here literally *is* `a / b` -- but with the BACKWARD
+    derivative's magnitude bounded, independently of the forward value.
+
+    `y0`/`c0` (what `b` is in every caller below) are tracer concentrations
+    that routinely (and correctly, matching the reference) reach
+    astronomically tiny nonzero values in near-depleted/anoxic layers --
+    normal baseline runs over a full multi-year record see `|y0|`/`|c0|`
+    down to ~1e-100..1e-160, and `a/b` there, while enormous, is still
+    finite and already handled fine forward. The derivative is a different
+    story: `d(a/b)/db = -a/b**2` needs `1/b**2`, and for `|b|` this small,
+    `b**2` underflows (often to an exact float64 0), making that term an
+    actual `inf`/NaN-producing quantity in the backward pass -- confirmed:
+    this is what turned `jax.grad` through this function's callers'
+    `jnp.linalg.solve` calls NaN when `train_M3_mcl_jax.py --target ri`'s
+    untrained/early-training K0 drove a Mendota run's kz to ~1e-26 m^2/s on
+    a calm, strongly-stratified step (2018-07-28 16:00), deepening an
+    already near-anoxic bottom layer's O2/POC a few more orders of
+    magnitude past where this had ever been exercised under gradients
+    before.
+
+    A first attempt fixed this by widening `safe()`'s forward floor instead
+    (`jnp.abs(v) < eps` rather than `v == 0`), but that changes the FORWARD
+    value for all the naturally-tiny-but-legitimate cases above too,
+    breaking exact parity with the reference model (~1.9 degC drift in a
+    full-record Ravn re-run) -- unacceptable, since bit-exact parity
+    against `processBased_lakeModel_functions.py` is this whole port's
+    validation contract. A second attempt wrapped a `_safe_reciprocal(b)`
+    and multiplied (`a * _safe_reciprocal(b)`) instead of dividing -- that
+    keeps `1/b` itself forward-identical, but `a * (1/b)` is its own extra
+    rounding step and is *not* always bit-identical to `a / b` in IEEE754
+    (confirmed: this alone produced the same multi-degree drift above, from
+    rounding alone, with no logic difference). Defining the custom JVP
+    directly on the division itself, as here, avoids both: the primal really
+    is the one `a / b` expression, so there is no second op to round
+    differently, while `jax.grad` still gets a bounded derivative."""
+    return a / b
+
+
+@_safe_div.defjvp
+def _safe_div_jvp(primals, tangents):
+    a, b = primals
+    a_dot, b_dot = tangents
+    primal_out = a / b
+    # `jnp.clip` saturates correctly even once `1.0 / b` / `-a / b**2` have
+    # already overflowed to +/-inf (from `b`/`b**2` underflowing to exact
+    # 0), so this is safe across the whole range of `b`, not just where
+    # `b**2` is still a representable nonzero double.
+    d_da = jnp.clip(1.0 / b, -_PRODCONS_GRAD_DERIV_MAX, _PRODCONS_GRAD_DERIV_MAX)
+    d_db = jnp.clip(-a / b ** 2, -_PRODCONS_GRAD_DERIV_MAX, _PRODCONS_GRAD_DERIV_MAX)
+    return primal_out, d_da * a_dot + d_db * b_dot
+
+
 def _prodcons_single_layer(y0, u_i, volume_i, npp_i, dt, theta_r, k_half, resp, beta):
     y0 = jnp.stack(y0)
 
@@ -1100,7 +1162,8 @@ def _prodcons_single_layer(y0, u_i, volume_i, npp_i, dt, theta_r, k_half, resp, 
 
     p0, d0 = _prodcons_pd_matrices(y0, consumption, npp, resp, beta)
     y0_safe = safe(y0)
-    a0 = jnp.where(eye, jnp.diag(dt * jnp.sum(d0, axis=1) / y0_safe + 1.0), -dt * p0 / y0_safe[None, :])
+    a0 = jnp.where(eye, jnp.diag(_safe_div(dt * jnp.sum(d0, axis=1), y0_safe) + 1.0),
+                   _safe_div(-dt * p0, y0_safe[None, :]))
     r0 = y0 + dt * jnp.diag(p0)
     c0 = jnp.linalg.solve(a0, r0)
 
@@ -1108,7 +1171,8 @@ def _prodcons_single_layer(y0, u_i, volume_i, npp_i, dt, theta_r, k_half, resp, 
     p_avg = 0.5 * (p0 + p1)
     d_avg = 0.5 * (d0 + d1)
     c0_safe = safe(c0)
-    a1 = jnp.where(eye, jnp.diag(dt * jnp.sum(d_avg, axis=1) / c0_safe + 1.0), -dt * p_avg / c0_safe[None, :])
+    a1 = jnp.where(eye, jnp.diag(_safe_div(dt * jnp.sum(d_avg, axis=1), c0_safe) + 1.0),
+                   _safe_div(-dt * p_avg, c0_safe[None, :]))
     r1 = y0 + dt * jnp.diag(p_avg)
     y_new = jnp.linalg.solve(a1, r1)
 
@@ -1185,8 +1249,9 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     `kz_process` from (also reported as `ri_process` in diagnostics) --
     i.e. exactly the intermediates `kz_process` itself was computed from,
     which a plain array can't give a caller access to (they aren't
-    otherwise exposed before this point in the step). `run_M3_mcl_jax.py`
-    uses the callable form so its NN's per-step input features
+    otherwise exposed before this point in the step). `train_M3_mcl_jax.py`'s
+    `simulate_hybrid()` (reused as-is by `run_M3_mcl_jax.py` to run an
+    already-trained model) uses the callable form so its NN's per-step input features
     (surface/bottom temperature, ice state) reflect this step's own state
     rather than the previous step's, and so it can fit a stability function
     directly against `ri` instead of (or as well as) correcting

@@ -1,6 +1,9 @@
 """
 Plot the process-based vs. LSTM-corrected eddy diffusivity (kz) from a
-`run_M3_mcl_jax.py` result (`mcl_result.npz`), alongside a handful of
+`train_M3_mcl_jax.py` result (`mcl_result.npz`, its baseline-vs-hybrid
+training-time comparison file -- not `run_M3_mcl_jax.py`'s
+`res_lake1_mcl_hybrid.npz`, which has no baseline to compare against),
+alongside a handful of
 single-time kz(depth) profiles and a temperature check at two depths
 against observations -- all in one figure.
 
@@ -8,7 +11,7 @@ Layout (one figure, three rows):
   1. Two heatmaps, time x depth, sharing a log color scale: kz_baseline
      (process-based `eddy_diffusivity_hendersonSellers`) and kz_hybrid
      (process-based kz corrected by the trained LSTM -- see
-     `run_M3_mcl_jax.py`'s module docstring for the correction design).
+     `train_M3_mcl_jax.py`'s module docstring for the correction design).
   2. A row of small panels, one per snapshot date (`--profile-dates` or
      `--n-profile-dates` evenly-spaced defaults), each plotting kz(depth)
      at that single time step for both baseline and hybrid on a shared
@@ -96,7 +99,7 @@ def shade_windows(ax, model_datetimes, train_lo, train_hi, test_lo, test_hi):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("result_path", help="Path to mcl_result.npz (from run_M3_mcl_jax.py).")
+    parser.add_argument("result_path", help="Path to mcl_result.npz (from train_M3_mcl_jax.py).")
     parser.add_argument("--depths", type=str, default="1,30",
                          help="Comma-separated depths (meters) for the temperature time-series "
                               "panels (default: 1,30). Each is snapped to the nearest model depth "

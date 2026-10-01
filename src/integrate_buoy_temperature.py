@@ -3,7 +3,7 @@ Merge the high-frequency buoy thermistor-chain temperature record
 (`ravn_2023.json`/`ravn_2024.json` + `sensor_level_buoy.sen`) into the
 manual-profile temperature file `run_config.csv`'s `u_ini_file` names
 (`L0001-HD.csv` for Ravn), so that every script in this project that reads
-temperature observations -- `calibrate_M3_jax.py`, `run_M3_mcl_jax.py`,
+temperature observations -- `calibrate_M3_jax.py`, `train_M3_mcl_jax.py`,
 `plot_output.py`, `plot_mcl_kz.py`, `plot_ri_diagnostics.py`, and
 `run_M3_calibrate_then_mcl.py` (which just runs the first two) -- gets ALL
 of it (the sparse manual profiles AND the dense hourly buoy record) by

@@ -1,7 +1,7 @@
 """
 Shared helpers for locating and loading observed data (temperature,
 dissolved oxygen, dissolved organic carbon) that `calibrate_M3_jax.py`,
-`run_M3_mcl_jax.py`, `plot_output.py`, `plot_mcl_kz.py`,
+`train_M3_mcl_jax.py`, `plot_output.py`, `plot_mcl_kz.py`,
 `plot_ri_diagnostics.py` and `integrate_buoy_temperature.py` all rely on --
 this exists so there is exactly one implementation of each, rather than
 several near-identical copies (there used to be two independent copies of

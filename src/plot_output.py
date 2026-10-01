@@ -545,8 +545,10 @@ def _resolve_series_key(res, name, series=None, note=False):
     """Return the dict key holding the `name` field (e.g. "temp", "o2",
     "docr"), or `None` if it isn't present in this result at all. Plain
     model output (`run_M3_jax.py`'s `res_lake1_jax_full.npz`/
-    `res_lake1.pkl`) stores a single array per field. `run_M3_mcl_jax.py`'s
-    `mcl_result.npz` instead stores a *pair* of series per field --
+    `res_lake1.pkl`, or `run_M3_mcl_jax.py`'s `res_lake1_mcl_hybrid.npz`,
+    which also uses plain field names) stores a single array per field.
+    `train_M3_mcl_jax.py`'s `mcl_result.npz` instead stores a *pair* of
+    series per field --
     `<name>_baseline` (process-based kz) and `<name>_hybrid` (process +
     LSTM-corrected kz) -- since the whole point of that file is comparing
     the two. If the plain key isn't present but this baseline/hybrid pair
@@ -568,7 +570,7 @@ def _resolve_series_key(res, name, series=None, note=False):
             )
         if note:
             print(f"No '{name}' key found -- this looks like an mcl_result.npz-style file "
-                  f"(run_M3_mcl_jax.py); using '{key}' (--series {chosen}). For a side-by-side "
+                  f"(train_M3_mcl_jax.py); using '{key}' (--series {chosen}). For a side-by-side "
                   f"baseline-vs-hybrid comparison including kz, use plot_mcl_kz.py instead.")
         return key
     return None
@@ -793,7 +795,7 @@ def main():
         "--series",
         choices=["baseline", "hybrid"],
         default=None,
-        help="Only relevant for an mcl_result.npz-style file (run_M3_mcl_jax.py), which "
+        help="Only relevant for an mcl_result.npz-style file (train_M3_mcl_jax.py), which "
         "stores paired 'temp_baseline'/'temp_hybrid' (and o2/docr/docl) series instead of "
         "single 'temp'/'o2'/'docr'/'docl' keys. Picks which one this script uses for all of "
         "them (default: hybrid). Ignored for a plain result file that already has plain keys.",

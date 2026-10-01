@@ -1,7 +1,10 @@
 """
 Sequential pipeline: gradient-based physical-parameter calibration
 (`calibrate_M3_jax.py`) followed by the LSTM kz-correction training
-(`run_M3_mcl_jax.py`), applying the calibrated parameters to
+(`train_M3_mcl_jax.py` -- renamed from `run_M3_mcl_jax.py`; that name now
+belongs to the separate script that *runs* an already-trained model
+standalone, without retraining -- see its own module docstring), applying
+the calibrated parameters to
 `model_params.csv` in between (`apply_calibration.py`) so the mcl stage
 trains its correction on top of the newly calibrated physics rather than
 whatever was on disk before.
@@ -57,11 +60,11 @@ called directly (not subprocessed) since it is a plain function with no cwd
 side effects. `backup=True` (its own default) keeps a timestamped copy of
 `model_params.csv` before overwriting it.
 
-Stage 3 (mcl) runs `run_M3_mcl_jax.py` as a subprocess (same cwd reason as
+Stage 3 (mcl) runs `train_M3_mcl_jax.py` as a subprocess (same cwd reason as
 stage 1) against the now-updated `model_params.csv`, so the LSTM kz
 correction is trained on top of the calibrated physical parameters rather
 than the pre-calibration ones. All physical parameters are held fixed
-during this stage, exactly as `run_M3_mcl_jax.py` does on its own -- only
+during this stage, exactly as `train_M3_mcl_jax.py` does on its own -- only
 its network weights are trained. `--mcl-target` picks what it fits:
 `kz` (default) corrects `kz_process` directly with a depth-basis
 polynomial (`--depth-basis-degree`/`--kz-reg`/`--max-log-correction`/
@@ -69,12 +72,18 @@ polynomial (`--depth-basis-degree`/`--kz-reg`/`--max-log-correction`/
 function `kz = K0*(1+alpha*Ri)**(-n)` against the closure's own
 Richardson number (`--ri-k0-init`/`--ri-alpha-init`/`--ri-n-init`/
 `--max-log-k0`/`--max-log-alpha`/`--max-log-n`) -- see
-`run_M3_mcl_jax.py`'s own module docstring (`DEFAULT_TARGET` comment) for
+`train_M3_mcl_jax.py`'s own module docstring (`DEFAULT_TARGET` comment) for
 the full rationale and why `ri` is inherently more stable regardless of
 what the network outputs. In `ri` mode, alpha/n are additionally smoothed
 with an explicit couple-hour EMA memory (`--ri-memory-hours`) rather than
 reacting to the LSTM's raw per-step output directly -- see
-`run_M3_mcl_jax.py`'s `DEFAULT_RI_MEMORY_HOURS` comment.
+`train_M3_mcl_jax.py`'s `DEFAULT_RI_MEMORY_HOURS` comment.
+
+This wrapper only trains (stage 3); it does not also run the trained model
+afterward. Once training finishes, `--nn-params-out`'s pickle can be run
+standalone, repeatedly and without retraining, via the separate
+`run_M3_mcl_jax.py Ravn --nn-params <that file>` -- this wrapper prints that
+exact command at the end of stage 3 as a reminder.
 
 `--skip-calibration` leaves `model_params.csv` untouched (stage 2 is
 skipped along with it, since there is nothing new to apply) and goes
@@ -110,7 +119,7 @@ from calibrate_M3_jax import (
     DEFAULT_TOPK as CAL_DEFAULT_TOPK,
     DEFAULT_TOPK_PER_VARIABLE as CAL_DEFAULT_TOPK_PER_VARIABLE,
 )
-from run_M3_mcl_jax import (
+from train_M3_mcl_jax import (
     DEFAULT_HIDDEN_SIZE, DEFAULT_DEPTH_BASIS_DEGREE, DEFAULT_KZ_REG,
     DEFAULT_TRAIN_START, DEFAULT_TRAIN_END, DEFAULT_TEST_START, DEFAULT_TEST_END,
     DEFAULT_TARGET, DEFAULT_MAX_LOG_CORRECTION, DEFAULT_MAX_KZ,
@@ -167,7 +176,7 @@ def run_apply_stage(data_dir_abs):
 
 
 def run_mcl_stage(data_dir_abs, args):
-    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "run_M3_mcl_jax.py"), data_dir_abs]
+    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "train_M3_mcl_jax.py"), data_dir_abs]
     if args.mcl_steps is not None:
         cmd += ["--steps", str(args.mcl_steps)]
     cmd += ["--chunk-steps", str(args.mcl_chunk_steps)]
@@ -241,7 +250,7 @@ def main():
                            "(default: all with observations in the window -- poc only if the "
                            "dataset's wq_ini_file has 'poc' rows)")
 
-    mcl = parser.add_argument_group("mcl stage (run_M3_mcl_jax.py)")
+    mcl = parser.add_argument_group("mcl stage (train_M3_mcl_jax.py)")
     mcl.add_argument("--mcl-steps", type=int, default=None,
                       help="mcl-stage simulation window in hourly steps (default: full record)")
     mcl.add_argument("--mcl-chunk-steps", type=int, default=MCL_DEFAULT_CHUNK_STEPS,
@@ -254,12 +263,12 @@ def main():
     mcl.add_argument("--kz-reg", type=float, default=DEFAULT_KZ_REG,
                       help=f"L2 penalty on the NN's weights (default {DEFAULT_KZ_REG})")
     mcl.add_argument("--mcl-target", choices=["kz", "ri"], default=DEFAULT_TARGET,
-                      help=f"what run_M3_mcl_jax.py fits (default {DEFAULT_TARGET}): 'kz' fits a "
+                      help=f"what train_M3_mcl_jax.py fits (default {DEFAULT_TARGET}): 'kz' fits a "
                            "depth-basis multiplicative correction on top of the process-based kz "
                            "estimate; 'ri' fits a Munk-Anderson-style stability function "
                            "kz = K0*(1+alpha*Ri)**(-n) directly against the Richardson number Ri "
                            "from eddy_diffusivity_hendersonSellers, with the NN estimating K0, "
-                           "alpha and n. See run_M3_mcl_jax.py's own DEFAULT_TARGET docstring "
+                           "alpha and n. See train_M3_mcl_jax.py's own DEFAULT_TARGET docstring "
                            "comment for the full rationale.")
     mcl.add_argument("--ri-k0-init", type=float, default=DEFAULT_RI_K0_INIT,
                       help=f"initial K0 (m^2/s) for --mcl-target ri (default {DEFAULT_RI_K0_INIT})")
@@ -270,7 +279,7 @@ def main():
     mcl.add_argument("--ri-memory-hours", type=float, default=DEFAULT_RI_MEMORY_HOURS,
                       help=f"e-folding memory time (hours) for alpha/n's EMA smoothing under "
                            f"--mcl-target ri (default {DEFAULT_RI_MEMORY_HOURS}); see "
-                           "run_M3_mcl_jax.py's DEFAULT_RI_MEMORY_HOURS comment.")
+                           "train_M3_mcl_jax.py's DEFAULT_RI_MEMORY_HOURS comment.")
     mcl.add_argument("--max-log-correction", type=float, default=DEFAULT_MAX_LOG_CORRECTION,
                       help=f"log-space clip on the --mcl-target kz correction (default {DEFAULT_MAX_LOG_CORRECTION})")
     mcl.add_argument("--max-kz", type=float, default=DEFAULT_MAX_KZ,
@@ -290,7 +299,7 @@ def main():
     mcl.add_argument("--mcl-test-early-stop-patience", type=int, default=DEFAULT_TEST_EARLY_STOP_PATIENCE,
                       help="stop mcl training if test-window RMSE plateaus even while training loss "
                            f"keeps improving (default {DEFAULT_TEST_EARLY_STOP_PATIENCE}; 0 disables) -- "
-                           "see run_M3_mcl_jax.py's DEFAULT_TEST_EARLY_STOP_PATIENCE comment.")
+                           "see train_M3_mcl_jax.py's DEFAULT_TEST_EARLY_STOP_PATIENCE comment.")
     mcl.add_argument("--mcl-test-early-stop-tol", type=float, default=DEFAULT_TEST_EARLY_STOP_TOL)
     mcl.add_argument("--mcl-test-worsen-patience", type=int, default=DEFAULT_TEST_WORSEN_PATIENCE,
                       help="stop mcl training faster if test-window RMSE actively regresses past its "
