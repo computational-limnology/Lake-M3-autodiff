@@ -3,7 +3,7 @@ km,Background eddy diffusivity,m2 s−1,1.40E-07
 k0,Adjustable eddy diffusivity,m2 s−1,0.01
 weight_kz,Weighting factor for eddy diffusivity (mixing intensity),Unitless,0.5
 piston_velocity,Gas transfer velocity/ velocity for air-water exchange,m s−1,1
-Cd,Momentum coefficient of wind,Unitless,0.0013
+Cd,Momentum coefficient of wind,Unitless,0.0010778321264008
 hydro_res_time,Hydrologic residence time,yr,1.8
 W_str,Wind-derived shear scaling term,Unitless,None
 denThresh,Density threshold for mixing,kg m−3,1.00E-03
@@ -14,16 +14,16 @@ light_poc,POC light extinction,m−1,0.7
 eps,Surface emissivity (for outgoing longwave),Unitless,0.97
 emissivity,Emissivity of water surface,Unitless,0.97
 sigma,Stefan-Boltzmann constant,W m-2 K-4,5.67E-08
-sw_factor,Multiplier for shortwave radiation,Unitless,1
-wind_factor,Multiplier for wind speed,Unitless,1
-at_factor,Multiplier for air temperature,Unitless,1
+sw_factor,Multiplier for shortwave radiation,Unitless,1.1800492772375832
+wind_factor,Multiplier for wind speed,Unitless,0.8288548592668206
+at_factor,Multiplier for air temperature,Unitless,1.01571161700353
 turb_factor,Multiplier for turbulent heat fluxes,Unitless,1
 Hgeo,Geothermal heat flux,W m−2,0.1
 resp_docr,Respiration rate of recalcitrant DOC,day−1,0.005
 resp_docl,Respiration rate of labile DOC,day−1,0.05
 resp_poc,Respiration rate of POC,day−1,0.15
 resp_pocr,Respiration rate of POC,day−1,0.015
-resp_pocl,Respiration rate of POC,day−1,0.15
+resp_pocl,Respiration rate of POC,day−1,1.4237360375039596e-06
 sed_sink,Idealized nutrient source rate,g m−2 day−1,-0.0626
 settling_rate_labile,Settling rate of POC,m day−1,0.07
 settling_rate_refractory,Settling rate of POC,m day−1,0.7
@@ -38,21 +38,21 @@ prop_oc_docr,Proportion of OC load that is recalcitrant DOC,Unitless,0.5
 prop_oc_docl,Proportion of OC load that is labile DOC,Unitless,0.05
 prop_oc_pocr,Proportion of OC load that is recalcitrant POC,Unitless,0.4
 prop_oc_pocl,Proportion of OC load that is labile POC,Unitless,0.05
-oc_load_factor, Multiplier on the oc concentration, unitless, 1
+oc_load_factor, Multiplier on the oc concentration, unitless,0.8233053480894742
 p2,2nd parameter in productivity curve,,1
 B,Light-use offset parameter,,0.61
 g,Gravity,ms−2,9.81
 meltP,Multiplier for ice melting,Unitless,1
 d_thick, Thickness of diffusive boundary layers, m,0.001
-f_sod,Steady sediment consumption of DO, g/m3/s,3.00E-05
+f_sod,Steady sediment consumption of DO, g/m3/s,3.501292669068999e-05
 LIGHTUSEBYPHOTOS, Light use, dimensionless,0.3
 k_min,Minimum (background) eddy diffusivity for eddy_diffusivity() Ri-based closure,m2 s-1,1.4e-07
-k_max,Maximum eddy diffusivity for eddy_diffusivity() Ri-based closure,m2 s-1,0.01
-alpha,Richardson-number stability-function coefficient for eddy_diffusivity(),unitless,10
-n,Richardson-number stability-function exponent for eddy_diffusivity(),unitless,1.5
+k_max,Maximum eddy diffusivity for eddy_diffusivity() Ri-based closure,m2 s-1,0.0001127398296866
+alpha,Richardson-number stability-function coefficient for eddy_diffusivity(),unitless,11.930443389322006
+n,Richardson-number stability-function exponent for eddy_diffusivity(),unitless,3
 Cd_bottom,Drag coefficient for friction on basin sides and bottom in the momentum equations (Goudsmit et al. 2002),unitless,0.002
-zero_net_transport,Closed-basin zero net transport constraint on momentum (1 = on / 0 = off),unitless,1
-seiche_alpha,Fraction of wind energy transferred to basin-scale seiches (Goudsmit et al. 2002; richardson_seiche closure),unitless,0.002
+zero_net_transport,Closed-basin zero net transport constraint on momentum (1 = on / 0 = off),unitless,0
+seiche_alpha,Fraction of wind energy transferred to basin-scale seiches (Goudsmit et al. 2002; richardson_seiche closure),unitless,7.474323499539372e-06
 mixing_efficiency,Osborn mixing efficiency Gamma for seiche-driven interior mixing (richardson_seiche closure),unitless,0.2
-sbl_drho,Density step below surface defining the base of the surface mixed layer (richardson_seiche closure),kg m-3,0.05
+sbl_drho,Density step below surface defining the base of the surface mixed layer (richardson_seiche closure),kg m-3,0.0444361245554713
 sbl_width,Width of the smooth surface-layer transition (richardson_seiche closure),kg m-3,0.01

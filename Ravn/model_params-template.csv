@@ -46,3 +46,13 @@ meltP,Multiplier for ice melting,Unitless,1
 d_thick, Thickness of diffusive boundary layers, m,0.001
 f_sod,Steady sediment consumption of DO, g/m3/s,3.00E-05
 LIGHTUSEBYPHOTOS, Light use, dimensionless,0.3
+k_min,Minimum (background) eddy diffusivity for eddy_diffusivity() Ri-based closure,m2 s-1,1.4e-07
+k_max,Maximum eddy diffusivity for eddy_diffusivity() Ri-based closure,m2 s-1,3E-4
+alpha,Richardson-number stability-function coefficient for eddy_diffusivity(),unitless,10
+n,Richardson-number stability-function exponent for eddy_diffusivity(),unitless,3
+Cd_bottom,Drag coefficient for friction on basin sides and bottom in the momentum equations (Goudsmit et al. 2002),unitless,0.002
+zero_net_transport,Closed-basin zero net transport constraint on momentum (1 = on / 0 = off),unitless,0
+seiche_alpha,Fraction of wind energy transferred to basin-scale seiches (Goudsmit et al. 2002; richardson_seiche closure),unitless,2E-5
+mixing_efficiency,Osborn mixing efficiency Gamma for seiche-driven interior mixing (richardson_seiche closure),unitless,0.2
+sbl_drho,Density step below surface defining the base of the surface mixed layer (richardson_seiche closure),kg m-3,0.05
+sbl_width,Width of the smooth surface-layer transition (richardson_seiche closure),kg m-3,0.01
