@@ -607,6 +607,17 @@ def _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume=None, s
 
         arrays[name] = arr
 
+    # Current speed sqrt(uvel^2 + vvel^2) -- the Goudsmit-style momentum
+    # fields saved by run_M3_jax.py/run_M3_mcl_jax.py; absent entirely from
+    # any output file produced before that addition, so this is skipped
+    # (not an error) when either field is missing.
+    if "uvel" in res and "vvel" in res:
+        uvel = to_numpy(res["uvel"])
+        vvel = to_numpy(res["vvel"])
+        uvel, _, _ = _apply_orientation(uvel, time_values, depth_values)
+        vvel, _, _ = _apply_orientation(vvel, time_values, depth_values)
+        arrays["speed"] = np.sqrt(uvel ** 2 + vvel ** 2)
+
     return arrays
 
 
@@ -653,6 +664,7 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
         (arrays.get("docl"), "DOCL (g/m3)", "DOC-L"),
         (arrays.get("pocr"), "POCR (g/m3)", "POC-R"),
         (arrays.get("pocl"), "POCL (g/m3)", "POC-L"),
+        (arrays.get("speed"), "Current speed (m/s)", "Current speed sqrt(uvel^2+vvel^2)"),
     ]
 
     for i, (data, cbar_label, title) in enumerate(data_list):

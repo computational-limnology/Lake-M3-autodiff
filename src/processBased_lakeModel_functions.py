@@ -333,10 +333,34 @@ def get_secview(secchifile):
     
     return(secview)
 
+# Column names seen across this project's meteo files for wind direction
+# (degrees, meteorological "from" convention: 0=from N, 90=from E, ... ).
+# Ravn's L0001-MET.csv has `wind_direction_10m (°)`; Mendota's NLDAS-derived
+# ME_nldas-16-24.csv has no direction column at all. `_FALLBACK_WIND_DIR_DEG`
+# is used whenever none of these columns are present, so every forcing
+# series downstream always has a `WindDir` column regardless of lake --
+# see jax_lakeModel_functions._wind_stress_components()'s docstring for how
+# this fallback is interpreted (wind held to a fixed axis, so momentum
+# forcing is not from a real measured direction for that lake).
+_WIND_DIR_COLUMN_CANDIDATES = [
+    "wind_direction_10m (°)", "wind_direction_10m", "WindDir",
+    "Wind_Direction_degree", "wind_direction",
+]
+_FALLBACK_WIND_DIR_DEG = 270.0  # "from the west" -> blows due east (+x)
+
+
 def provide_meteorology(meteofile, windfactor, lat, lon, elev, startDate):
 
     meteo = pd.read_csv(meteofile)
     daily_meteo = meteo
+
+    wind_dir_col = next((c for c in _WIND_DIR_COLUMN_CANDIDATES if c in daily_meteo.columns), None)
+    if wind_dir_col is not None:
+        daily_meteo['WindDir'] = daily_meteo[wind_dir_col].astype(float)
+    else:
+        # No measured wind direction for this lake's meteo file -- hold the
+        # wind axis fixed (see module-level comment above).
+        daily_meteo['WindDir'] = _FALLBACK_WIND_DIR_DEG
 
     daily_meteo['date'] = pd.to_datetime(daily_meteo['datetime'])
 

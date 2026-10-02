@@ -1,12 +1,12 @@
 var,Ravn
-start_time,1/1/20 0:00
+start_time,1/1/23 0:00
 end_time,12/31/24 23:59
 nx,64
 dt,3600
 dx,0.5
 pgdl_mode,on
 training_data_path,./output/Ravn
-diffusion_method,hendersonSellers
+diffusion_method,richardson_seiche
 scheme,implicit
 u_ini_file,./L0001-HD.csv
 wq_ini_file,./L0001-WQ.csv

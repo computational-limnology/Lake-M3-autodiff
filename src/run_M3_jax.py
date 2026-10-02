@@ -90,6 +90,14 @@ def build_forcing_series(daily_meteo, times, wind_factor):
         Pa=interp("Surface_Level_Barometric_Pressure_pascal"),
         RH=interp("Relative_Humidity_percent"),
         PP=interp("Precipitation_millimeterPerDay"),
+        # Wind direction (degrees) for decomposing wind-stress forcing into
+        # uvel/vvel components -- see provide_meteorology()'s module-level
+        # comment for the fallback used when a lake's meteo file has no
+        # direction column. Plain linear interpolation (like every other
+        # column here), not circular -- a step that wraps 359->1 deg will
+        # briefly interpolate through ~180 deg; acceptable for hourly data
+        # and consistent with this feature's overall approximate nature.
+        WindDir=interp("WindDir"),
     )
 
 
@@ -224,7 +232,10 @@ def main():
         area=jnp.asarray(area), depth=jnp.asarray(depth), volume=jnp.asarray(volume),
         dx=dx, dt=dt, latitude=float(lake_config["Latitude"]),
     )
-    params = default_params(model_params, ice_and_snow)
+    params = default_params(
+        model_params, ice_and_snow,
+        diffusion_method=str(run_config.get("diffusion_method", "hendersonSellers")),
+    )
 
     def _to_bool(x):
         # get_ice_and_snow() leaves non-numeric cells (e.g. "FALSE") as raw
@@ -246,14 +257,17 @@ def main():
 
         t0 = time.time()
         final_state, per_step = run_with_progress(
-            temperature_step, state0, forcing, geometry, params, ["u"], args.chunk_steps,
+            temperature_step, state0, forcing, geometry, params, ["u", "uvel", "vvel", "E_seiche"], args.chunk_steps,
             desc="Thermal engine",
         )
         t1 = time.time()
         print(f"Done in {t1 - t0:.2f} s ({(t1 - t0) / len(step_times) * 1000:.3f} ms/step)")
 
         out_path = os.path.join(os.getcwd(), "res_lake1_jax_temp.npz")
-        np.savez(out_path, temp=per_step["u"], times=step_times, depth=np.asarray(depth))
+        np.savez(
+            out_path, temp=per_step["u"], uvel=per_step["uvel"], vvel=per_step["vvel"], E_seiche=per_step["E_seiche"],
+            times=step_times, depth=np.asarray(depth),
+        )
         print(f"Saved temperature output to {out_path}")
         return
 
@@ -297,7 +311,7 @@ def main():
     t0 = time.time()
     final_state, per_step = run_with_progress(
         full_step_fn, state0, forcing, geometry, params,
-        ["u", "o2", "docr", "docl", "pocr", "pocl"], args.chunk_steps,
+        ["u", "o2", "docr", "docl", "pocr", "pocl", "uvel", "vvel", "E_seiche"], args.chunk_steps,
         desc="Lake model",
     )
     t1 = time.time()
@@ -308,6 +322,7 @@ def main():
         out_path,
         temp=per_step["u"], o2=per_step["o2"], docr=per_step["docr"],
         docl=per_step["docl"], pocr=per_step["pocr"], pocl=per_step["pocl"],
+        uvel=per_step["uvel"], vvel=per_step["vvel"], E_seiche=per_step["E_seiche"],
         times=step_times, depth=np.asarray(depth), volume=np.asarray(volume),
     )
     print(f"Saved results to {out_path}")

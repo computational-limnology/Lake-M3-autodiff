@@ -206,7 +206,10 @@ def main():
         altitude=float(lake_config["Elevation"]), hypso_weight=hypso_weight, mean_depth=mean_depth,
         hydro_res_time_hr=hydro_res_time_hr,
     )
-    phys_params = default_params(model_params, ice_and_snow)
+    phys_params = default_params(
+        model_params, ice_and_snow,
+        diffusion_method=str(run_config.get("diffusion_method", "hendersonSellers")),
+    )
 
     def _to_bool(x):
         if isinstance(x, str):
@@ -249,6 +252,8 @@ def main():
         temp=np.asarray(hybrid["u"]), o2=np.asarray(hybrid["o2"]),
         docr=np.asarray(hybrid["docr"]), docl=np.asarray(hybrid["docl"]),
         pocr=np.asarray(hybrid["pocr"]), pocl=np.asarray(hybrid["pocl"]),
+        uvel=np.asarray(hybrid["uvel"]), vvel=np.asarray(hybrid["vvel"]),
+        E_seiche=np.asarray(hybrid["E_seiche"]),
         times=step_times, depth=np.asarray(depth), volume=np.asarray(volume),
         kz=np.asarray(hybrid["kz"]), kz_process=np.asarray(hybrid["kz_process"]),
         # --- provenance: makes this file's origin unambiguous even without

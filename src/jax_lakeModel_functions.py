@@ -397,6 +397,293 @@ def eddy_diffusivity_hendersonSellers(rho, depth, g, rho_0, ice, Uw, latitude, T
     return kz + km
 
 
+_EDDY_DIFFUSIVITY_S2_FLOOR = 1e-10  # s^-2 -- guards Ri=N2/S2 against a near-zero shear denominator
+# Bounds the backward-only derivative `_ri_safe_div` computes for Ri=N2/S2 --
+# see its docstring for why a plain forward floor on S2 (above) is NOT
+# enough on its own, unlike this module's other S2 users.
+_EDDY_DIFFUSIVITY_GRAD_MAX = 1.0
+
+
+@jax.custom_jvp
+def _ri_safe_div(n2, s2):
+    """`n2 / s2`, forward-identical to a plain division (so `Ri` itself is
+    unaffected to the last bit), but with a backward derivative bounded to
+    +-`_EDDY_DIFFUSIVITY_GRAD_MAX` instead of the plain quotient rule's
+    `d(Ri)/d(s2) = -n2/s2**2`.
+
+    This is needed, and is NOT redundant with flooring `S2` above: flooring
+    only stops `S2` from hitting exact 0 (a forward-safety guard), but does
+    nothing about the size of the *derivative* once `S2` is merely small --
+    `-N2/S2**2` still blows up continuously as `S2` approaches its floor
+    from above. And `S2` sitting at or near its floor is not a rare edge
+    case for this closure: `uvel`/`vvel` both start at 0 (a lake at rest)
+    and only develop shear gradually as wind forcing spins up currents, so
+    `S2` is at or near `_EDDY_DIFFUSIVITY_S2_FLOOR` over large stretches of
+    any simulation, not just a one-off initial transient.
+
+    Confirmed by direct measurement, not just reasoned about: with
+    `diffusion_method="richardson"`, a calibration gradient check on real
+    Ravn data showed k_min/k_max/alpha/n gradients of order 1e16-1e22 --
+    and, worse, every OTHER calibrated parameter's gradient (Cd, sw_factor,
+    wind_factor, ...) *also* jumped from its normal O(1) scale to that same
+    ~1e16-1e22 scale, even though those parameters have nothing to do with
+    this closure -- because backpropagation sums contributions through the
+    whole multi-step simulation, so one poisoned per-step derivative
+    anywhere inflates the total gradient for every parameter that
+    influences any upstream step. The same check with
+    `diffusion_method="hendersonSellers"` (where this division is never
+    evaluated) gave ordinary-scale gradients for every parameter and
+    exactly 0 for k_min/k_max/alpha/n, isolating this division as the
+    source rather than, say, the momentum equations' own Coriolis/diffusion
+    terms (both closures run those every step regardless).
+
+    The bound itself is chosen from the *other* side of the chain rule:
+    `kz = k_min + k_max*(1+alpha*Ri)**(-n)` already saturates towards
+    `k_min` for large `Ri` regardless of its exact value, so `d(kz)/d(Ri)`
+    is itself small exactly where `d(Ri)/d(S2)` would otherwise be huge --
+    bounding the latter changes no simulated `kz` value (the primal `Ri` is
+    untouched) and only discards a numerically meaningless gradient spike
+    through an already-saturated region, the same reasoning `_safe_div`
+    above uses for the production/consumption solve."""
+    return n2 / s2
+
+
+@_ri_safe_div.defjvp
+def _ri_safe_div_jvp(primals, tangents):
+    n2, s2 = primals
+    n2_dot, s2_dot = tangents
+    primal_out = n2 / s2
+    d_dn2 = jnp.clip(1.0 / s2, -_EDDY_DIFFUSIVITY_GRAD_MAX, _EDDY_DIFFUSIVITY_GRAD_MAX)
+    d_ds2 = jnp.clip(-n2 / s2 ** 2, -_EDDY_DIFFUSIVITY_GRAD_MAX, _EDDY_DIFFUSIVITY_GRAD_MAX)
+    return primal_out, d_dn2 * n2_dot + d_ds2 * s2_dot
+
+
+def eddy_diffusivity(rho, depth, g, rho_0, uvel, vvel, k_min, k_max, alpha, n, return_ri=False):
+    """Depth-resolved eddy diffusivity from the *true* gradient Richardson
+    number `Ri = N^2/S^2` (buoyancy frequency squared over vertical shear
+    squared of the depth-resolved horizontal velocities `uvel`/`vvel`),
+    combined via the classical Munk-Anderson stability-function form:
+
+        Kz = k_min + k_max * (1 + alpha*Ri)**(-n)
+
+    This is a separate, independent eddy-diffusivity closure from
+    `eddy_diffusivity_hendersonSellers()` -- it is not a drop-in replacement
+    and is not wired into `full_step`/`temperature_step` by default (those
+    still use the Henderson-Sellers closure, optionally `kz_override`'d, as
+    before). Use it the same way an MCL `kz_override` is used, or call it
+    directly, when real velocity shear (from the Goudsmit momentum fields
+    `uvel`/`vvel`) is the desired stratification diagnostic instead of
+    Henderson-Sellers' own wind/depth/decay-based internal "Ri" (a
+    different, empirical quantity of the same name -- see that function's
+    `return_ri` branch) or the MCL `--target ri` stability function (which
+    reuses the *same* empirical Ri, not this one).
+
+    `k_min`/`k_max`/`alpha`/`n` are read from `model_params.csv` (see
+    `default_params()`), making them calibratable the same way every other
+    entry of `params` is.
+
+    N^2 and S^2 are both computed with the same forward-difference-then-
+    pad-the-last-layer discretization `eddy_diffusivity_hendersonSellers`
+    already uses for its own buoyancy term above, so the two closures are
+    directly comparable layer-for-layer.
+    """
+    dz = depth[1:] - depth[:-1]
+    N2 = jnp.abs(rho[1:] - rho[:-1]) / dz * g / rho_0
+    N2 = jnp.concatenate([N2, N2[-1:]])
+
+    dudz = (uvel[1:] - uvel[:-1]) / dz
+    dvdz = (vvel[1:] - vvel[:-1]) / dz
+    S2 = dudz ** 2 + dvdz ** 2
+    S2 = jnp.concatenate([S2, S2[-1:]])
+    # Forward-safety floor (keeps S2 off exact 0); see `_ri_safe_div`'s
+    # docstring for why this floor alone does NOT also bound the division's
+    # gradient, and why that additionally needs a custom JVP here.
+    S2 = jnp.maximum(S2, _EDDY_DIFFUSIVITY_S2_FLOOR)
+
+    Ri = _ri_safe_div(N2, S2)
+    kz = k_min + k_max * (1.0 + alpha * Ri) ** (-n)
+
+    if return_ri:
+        return kz, Ri
+    return kz
+
+
+# `run_config.csv`'s `diffusion_method` keyword -> which eddy-diffusivity
+# closure `full_step()`/`temperature_step()` compute `kz_process` from. Same
+# switch idea as the numpy reference's own `diffusion_method` if/elif chain
+# (processBased_lakeModel_functions.py, e.g. line ~4595), just with the two
+# closures this JAX port actually implements as options -- "hondzoStefan"/
+# "munkAnderson"/"pacanowskiPhilander" (the reference's other branches) have
+# no JAX port and are not valid values here.
+DIFFUSION_METHODS = ("hendersonSellers", "richardson", "richardson_seiche")
+
+
+# ---------------------------------------------------------------------------
+# "richardson_seiche": resolved-shear Ri closure in the surface mixed layer,
+# seiche-driven boundary mixing (Goudsmit et al. 2002) below it.
+#
+# Why split the column: in a 1D model the wind-driven currents are roughly
+# right near the surface (wind stress balanced locally by vertical mixing),
+# but wrong below it -- a single water column has no basin-scale pressure
+# gradients, so deep currents either accelerate as a slab or carry an
+# unrealistic depth-uniform return flow. Feeding that deep shear into Ri
+# kept kz at k_max down to 30 m on Ravn. Here resolved shear only drives
+# mixing inside the surface layer; below it, mixing comes from the energy of
+# basin-scale internal seiches, lost by friction at the lakebed and turned
+# into a diffusivity with the Osborn relation.
+# ---------------------------------------------------------------------------
+
+_SEICHE_E_EPS = 1.0       # J -- keeps sqrt(E) differentiable at E = 0
+_OSBORN_N2_FLOOR = 1e-7   # s^-2 -- floor on N2 in K = Gamma*eps/N2 (well-mixed water)
+
+
+def seiche_energy_step(E, Uw_eff, area, volume, dt, ice, seiche_alpha, c10, cd_bottom,
+                       rho_air=1.225, rho_0=1000.0):
+    """One step of the seiche energy budget, Goudsmit et al. (2002) eq. 15:
+
+        dE/dt = a * A0 * rho_air * c10 * W10**3  -  gamma * E**1.5
+        gamma = C_Deff * A0 * V**-1.5 * rho_0**-0.5
+
+    The first term is the fraction `a` (`seiche_alpha`; calibrated to
+    1.7e-3 for Lake Alpnach and ~6.2e-3 for Lake Baldegg in the paper) of
+    the wind energy input that goes into basin-scale seiches; it is switched
+    off under ice. The second is the loss by friction at the basin
+    boundaries, with C_Deff ~ 0.002 (the same coefficient as `Cd_bottom` in
+    the momentum equations). The paper reports a seiche-energy half-life of
+    about 3 days with these values.
+
+    Solved semi-implicitly, E_new = (E + dt*P) / (1 + dt*gamma*sqrt(E)), so
+    E stays positive for any dt and the E**1.5 loss can't overshoot.
+    Returns (E_new, loss_rate [W]) -- the loss over this step, evaluated at
+    E_new, which `seiche_interior_diffusivity` turns into mixing."""
+    A0 = area[0]
+    V = jnp.sum(volume)
+    open_water = jnp.where(ice, 0.0, 1.0)
+    P_in = seiche_alpha * A0 * rho_air * c10 * Uw_eff ** 3 * open_water
+    gamma = cd_bottom * A0 * V ** (-1.5) * rho_0 ** (-0.5)
+    sqrt_E = jnp.sqrt(E + _SEICHE_E_EPS)
+    E_new = (E + dt * P_in) / (1.0 + dt * gamma * sqrt_E)
+    loss = gamma * E_new * jnp.sqrt(E_new + _SEICHE_E_EPS)
+    return E_new, loss
+
+
+def seiche_interior_diffusivity(loss, N2, area, dx, cd_bottom, mixing_efficiency, k_max, rho_0=1000.0):
+    """Turn the seiche energy loss [W] into a depth-resolved diffusivity.
+
+    Goudsmit et al. (2002) eqs. 20-21: a fraction 10*sqrt(C_Deff) (~45% for
+    C_Deff = 0.002) of the loss is dissipated in the viscous layer at the
+    bed and produces no turbulence; the rest is spread evenly over the
+    lakebed area, so the turbulence production per unit mass at depth z is
+    proportional to the bottom area that layer touches:
+
+        eps(z) = (1/A)(dA/dz) * loss * (1 - 10*sqrt(C_Deff)) / (A_bottom * rho_0)
+
+    (`sediment_area_per_volume` gives (1/A)(dA/dz); the total lakebed area
+    A_bottom is the surface area A0, since the side areas telescope.)
+
+    Goudsmit feed this into a k-eps model's TKE equation. This model has no
+    TKE variable, so the diffusivity comes from the Osborn relation instead,
+    K = Gamma * eps / N2 with mixing efficiency Gamma ~ 0.2 -- a local
+    production = dissipation shortcut with no memory or vertical spreading
+    of turbulence. K is capped at k_max (relevant only in near-unstratified
+    water, which the surface-layer closure covers anyway) and N2 is floored
+    so the division stays finite."""
+    useful = jnp.maximum(1.0 - 10.0 * jnp.sqrt(cd_bottom), 0.0)
+    eps = sediment_area_per_volume(area, dx) * loss * useful / (area[0] * rho_0)
+    K = mixing_efficiency * eps / jnp.maximum(N2, _OSBORN_N2_FLOOR)
+    return jnp.minimum(K, k_max)
+
+
+def surface_layer_weight(rho, sbl_drho, sbl_width):
+    """Smooth indicator of the surface mixed layer: ~1 where the water is
+    within `sbl_drho` [kg/m3] of the surface density, ~0 below, with a
+    transition `sbl_width` [kg/m3] wide. A sigmoid instead of a hard
+    threshold keeps the mixed-layer depth differentiable (a hard "first
+    depth where drho > threshold" would jump cell to cell and give zero or
+    undefined gradients)."""
+    return jax.nn.sigmoid((rho[0] + sbl_drho - rho) / sbl_width)
+
+
+def eddy_diffusivity_richardson_seiche(rho, depth, g, rho_0, uvel, vvel, k_min, k_max, alpha, n,
+                                       seiche_loss, area, dx, cd_bottom, mixing_efficiency,
+                                       sbl_drho, sbl_width, return_ri=False):
+    """kz = w * K_surface + (1 - w) * K_interior, floored at k_min, where
+
+    - w is `surface_layer_weight` (surface mixed layer ~ 1, below ~ 0),
+    - K_surface is the resolved-shear Ri closure `eddy_diffusivity()`
+      (k_min + k_max*(1+alpha*Ri)**-n), and
+    - K_interior is the seiche/Osborn diffusivity
+      `seiche_interior_diffusivity()`.
+
+    Below the surface layer resolved currents no longer affect mixing at all.
+    The Ri returned (for diagnostics/MCL) is the resolved-shear Ri."""
+    K_surf, Ri = eddy_diffusivity(rho, depth, g, rho_0, uvel, vvel, k_min, k_max, alpha, n, return_ri=True)
+    N2 = jnp.abs(rho[1:] - rho[:-1]) / (depth[1:] - depth[:-1]) * g / rho_0
+    N2 = jnp.concatenate([N2, N2[-1:]])
+    K_int = seiche_interior_diffusivity(seiche_loss, N2, area, dx, cd_bottom, mixing_efficiency, k_max)
+    w = surface_layer_weight(rho, sbl_drho, sbl_width)
+    kz = jnp.maximum(w * K_surf + (1.0 - w) * K_int, k_min)
+    if return_ri:
+        return kz, Ri
+    return kz
+
+
+def _seiche_inputs(state, Uw_eff, area, volume, dx, dt, ice, params):
+    """Advance the seiche energy budget one step and bundle what the
+    "richardson_seiche" closure needs. Run every step regardless of
+    diffusion_method (it's cheap and E_seiche is a useful diagnostic); for
+    "hendersonSellers"/"richardson" the result is simply never used for
+    mixing, so those closures are numerically unaffected."""
+    E_new, loss = seiche_energy_step(
+        state.E_seiche, Uw_eff, area, volume, dt, ice, params["seiche_alpha"], params["Cd"],
+        params["Cd_bottom"], rho_0=params["rho_fw"],
+    )
+    seiche = dict(
+        loss=loss, area=area, dx=dx, cd_bottom=params["Cd_bottom"],
+        mixing_efficiency=params["mixing_efficiency"], sbl_drho=params["sbl_drho"],
+        sbl_width=params["sbl_width"],
+    )
+    return E_new, seiche
+
+
+def compute_eddy_diffusivity(
+    diffusion_method, rho, depth, g, rho_0, ice, Uw, latitude, T0, kzn_prev, Cd, km, weight_kz,
+    uvel, vvel, k_min, k_max, alpha, n, return_ri=False, seiche=None,
+):
+    """Dispatch on `diffusion_method` (a plain Python string -- e.g.
+    `params["diffusion_method"]`, set from `run_config.csv` by
+    `default_params()` -- never a traced array, so this is an ordinary
+    Python if/else resolved once at trace time, not a `jnp.where`; each
+    value compiles to exactly one closure's graph):
+
+      "hendersonSellers"  -- `eddy_diffusivity_hendersonSellers()` (default)
+      "richardson"        -- `eddy_diffusivity()` (true Ri=N2/S2 closure,
+                              needs `uvel`/`vvel` and k_min/k_max/alpha/n)
+      "richardson_seiche" -- `eddy_diffusivity_richardson_seiche()`: the
+                              above in the surface layer, seiche/Osborn
+                              mixing below; needs `seiche`, a dict with
+                              loss, area, dx, cd_bottom, mixing_efficiency,
+                              sbl_drho, sbl_width
+    """
+    if diffusion_method == "hendersonSellers":
+        return eddy_diffusivity_hendersonSellers(
+            rho, depth, g, rho_0, ice, Uw, latitude, T0, kzn_prev, Cd, km, weight_kz, return_ri=return_ri,
+        )
+    elif diffusion_method == "richardson":
+        return eddy_diffusivity(rho, depth, g, rho_0, uvel, vvel, k_min, k_max, alpha, n, return_ri=return_ri)
+    elif diffusion_method == "richardson_seiche":
+        return eddy_diffusivity_richardson_seiche(
+            rho, depth, g, rho_0, uvel, vvel, k_min, k_max, alpha, n,
+            seiche["loss"], seiche["area"], seiche["dx"], seiche["cd_bottom"],
+            seiche["mixing_efficiency"], seiche["sbl_drho"], seiche["sbl_width"], return_ri=return_ri,
+        )
+    else:
+        raise ValueError(
+            f"Unknown diffusion_method {diffusion_method!r} (from run_config.csv) -- "
+            f"expected one of {DIFFUSION_METHODS!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Heating module: matches `heating_module` line 1065 (temperature-only path).
 # ---------------------------------------------------------------------------
@@ -623,6 +910,205 @@ def _diffuse_tracer(x, sub, sup, a, b, c, dt):
     return _thomas_solve(a, b, c, rhs)
 
 
+# ---------------------------------------------------------------------------
+# Momentum (uvel/vvel): depth-resolved horizontal velocity, following the
+# momentum-equation part of Goudsmit et al. 2002's SIMSTRAT-lineage k-eps
+# lake model --
+#   d(uvel)/dt = d/dz(nu_t * d(uvel)/dz) + f*vvel
+#   d(vvel)/dt = d/dz(nu_t * d(vvel)/dz) - f*uvel
+# forced by wind shear stress (surface flux BC) and the Coriolis parameter
+# f. This is momentum-only: it does NOT implement the paper's k-eps
+# turbulence closure. Instead it reuses this model's existing `kz` (the
+# Henderson-Sellers closure, optionally MCL-corrected) as nu_t, i.e. it
+# assumes a turbulent Prandtl number of 1 (nu_t == nu'_t, the scalar eddy
+# diffusivity already used for temperature/O2/DOC transport). The real
+# Goudsmit k-eps closure relates the two through a Prandtl/Schmidt number
+# that is generally not 1 (particularly under strong stratification) --
+# this is a documented simplification, not a port of that part of the paper.
+# ---------------------------------------------------------------------------
+
+_OMEGA_EARTH = 7.2921159e-5  # rad/s, Earth's rotation rate
+_RHO_AIR = 1.225  # kg/m^3 -- matches mixing_step's hardcoded wind-stress constant
+
+
+def coriolis_parameter(latitude_deg):
+    """f = 2*Omega*sin(latitude) [s^-1]."""
+    return 2.0 * _OMEGA_EARTH * jnp.sin(jnp.deg2rad(latitude_deg))
+
+
+def _wind_stress_components(Uw_eff, wind_dir_deg, Cd):
+    """Decompose the scalar wind-stress magnitude (same quadratic drag law
+    as `mixing_step`'s `tau = 1.225 * Cd * Uw**2`) into x/y components using
+    the wind direction (meteorological convention: degrees clockwise from
+    north, the direction the wind is blowing *from*). `wind_dir_deg` is
+    always present in the forcing series -- see
+    `processBased_lakeModel_functions.provide_meteorology()`'s fallback
+    (held at 270 deg, "from the west" -> blowing due +x) for lakes whose
+    meteo file has no measured wind direction column; for those lakes vvel
+    develops purely from Coriolis rotation of the (real, wind-speed-driven)
+    uvel forcing, not from any real directional wind data."""
+    theta = jnp.deg2rad(wind_dir_deg)
+    tau = _RHO_AIR * Cd * Uw_eff ** 2
+    tau_x = tau * (-jnp.sin(theta))
+    tau_y = tau * (-jnp.cos(theta))
+    return tau_x, tau_y
+
+
+def _coriolis_rotate(uvel, vvel, f, dt):
+    """Exact solution of the linear ODE pair `d(uvel)/dt = f*vvel`,
+    `d(vvel)/dt = -f*uvel` (pure rotation at angular rate f) over one step:
+    a rotation by angle `f*dt`. Used instead of a forward-Euler update
+    because it is unconditionally stable regardless of the size of `f*dt`
+    (for this model's dt=3600s and realistic f~1e-4 s^-1, f*dt ~ 0.3-0.4,
+    not obviously small enough to trust an explicit update)."""
+    cos_fdt = jnp.cos(f * dt)
+    sin_fdt = jnp.sin(f * dt)
+    uvel_new = uvel * cos_fdt + vvel * sin_fdt
+    vvel_new = -uvel * sin_fdt + vvel * cos_fdt
+    return uvel_new, vvel_new
+
+
+def _momentum_diffusion_step(uvel, vvel, kz, area, dx, dt, tau_x, tau_y, rho_0):
+    """Depth-resolved momentum diffusion sharing `_flux_form_coeffs` (same
+    eddy viscosity/area/dx/dt the temperature and WQ tracers diffuse with --
+    see the module note above this section on the implied Prandtl-number-1
+    assumption).
+
+    - Surface (index 0): a flux boundary condition from the wind shear
+      stress, added as a source term `dt * tau / (rho_0 * dx)` to the top
+      layer's right-hand side (the standard discretization of a specified
+      Neumann flux over a finite-volume cell of thickness `dx`).
+    - Bottom (index -1): zero turbulent flux, i.e. the same natural
+      boundary `_flux_form_coeffs` builds for every tracer. Momentum is
+      removed at the lakebed by `_boundary_friction_step()` instead, as a
+      quadratic drag on the sediment area each layer touches -- the flat
+      bottom under the deepest layer *and* the sloping basin sides at every
+      other depth. (This replaces the earlier no-slip Dirichlet row, which
+      only ever acted on the deepest 0.5 m cell and left the rest of the
+      column essentially frictionless.)
+
+    `_flux_form_coeffs` and `_thomas_solve` themselves are untouched, so
+    every other field that uses them (temperature, O2, DOCr, DOCl) is
+    numerically unaffected by this function's existence."""
+    sub, sup, a, b, c = _flux_form_coeffs(area, kz, dx, dt)
+
+    def rhs_for(x, surf_forcing):
+        x_left = jnp.concatenate([x[:1], x[:-1]])
+        x_right = jnp.concatenate([x[1:], x[-1:]])
+        Lx = sup * (x_right - x) + sub * (x_left - x)
+        rhs = x + 0.5 * dt * Lx
+        rhs = rhs.at[0].add(dt * surf_forcing / (rho_0 * dx))
+        return rhs
+
+    uvel_new = _thomas_solve(a, b, c, rhs_for(uvel, tau_x))
+    vvel_new = _thomas_solve(a, b, c, rhs_for(vvel, tau_y))
+    return uvel_new, vvel_new
+
+
+# Small speed added inside the drag law's |U| so its derivative stays finite
+# at rest: d|U|/du = u/|U| is 0/0 at u=v=0 (a NaN under autodiff), while
+# u/sqrt(u^2+v^2+eps^2) is bounded by 1 everywhere. 1e-4 m/s is far below
+# any current that matters for the drag itself.
+_FRICTION_SPEED_EPS = 1e-4
+
+
+def sediment_area_per_volume(area, dx):
+    """Sediment (lakebed) area each layer is in contact with, per unit
+    layer volume [1/m]. Layer i touches the sloping basin side between its
+    own area and the next layer's area, `area[i] - area[i+1]`; the deepest
+    layer also sits on the flat bottom, `area[-1]`. Dividing by the layer
+    volume `area[i] * dx` turns a bottom stress [N/m2] acting on that
+    sediment area into a momentum tendency for the whole layer. `area` is
+    given at layer centres (see `get_hypsography`), so the side term is the
+    centre-to-centre area difference -- a first-order approximation of the
+    sediment area within each layer, exact for a linear hypsography."""
+    sides = jnp.maximum(area[:-1] - area[1:], 0.0)
+    contact = jnp.concatenate([sides, area[-1:]])
+    return contact / (area * dx)
+
+
+def _boundary_friction_step(uvel, vvel, area, dx, dt, cd_bottom):
+    """Quadratic bottom friction along the basin sides and bottom, weighted
+    by the sediment area each layer touches (`sediment_area_per_volume`):
+
+        d(u,v)/dt = - cd_bottom * |U| * (u,v) * dA/(A dz)
+
+    i.e. a stress `rho_0 * cd_bottom * |U| * (u,v)` acting on the lakebed
+    area within each layer. This follows Goudsmit et al. (2002), who model
+    the loss of basin-scale (seiche) kinetic energy as bottom friction at
+    the basin boundaries with an effective drag coefficient
+    C_Deff ~ 0.002 and distribute it in proportion to the bottom area at
+    each depth (their eqs. 13-14 and the PSeiche,sed term) -- applied here
+    directly to the mean currents rather than to a separate seiche-energy
+    budget, since this model has no k-eps/seiche module.
+
+    Solved semi-implicitly with |U| from the start of the step,
+    `u_new = u / (1 + dt*cd_bottom*|U|*dA/(A dz))`: unconditionally stable
+    for any dt (an explicit update would overshoot through zero for the
+    strongly-damped deepest layer) and preserves the current's direction."""
+    gamma = sediment_area_per_volume(area, dx)
+    speed = jnp.sqrt(uvel ** 2 + vvel ** 2 + _FRICTION_SPEED_EPS ** 2)
+    damp = 1.0 / (1.0 + dt * cd_bottom * speed * gamma)
+    return uvel * damp, vvel * damp
+
+
+def _remove_net_transport(uvel, vvel, area, weight=1.0):
+    """Closed-basin (zero net transport) constraint: subtract the
+    area-weighted depth mean from both velocity components,
+
+        u_i <- u_i - weight * sum(A_i u_i) / sum(A_i)
+
+    so that the column-integrated transport sum(A_i u_i dz) is zero.
+
+    In an enclosed lake, water pushed downwind at the surface piles up at
+    the downwind shore; the resulting surface tilt creates a pressure
+    gradient that is the same at every depth (barotropic) and drives the
+    return flow. A 1D model has no shoreline, so without this term the wind
+    accelerates the whole column as a slab. Removing a depth-uniform value
+    is the discrete form of that pressure-gradient force, with its strength
+    chosen each step so the net transport stays zero. It does not change the
+    vertical shear (du/dz), so vertical diffusion, friction and Coriolis
+    still act on the depth-varying (baroclinic) part as before.
+
+    Limitation: only the barotropic pressure gradient is represented. In a
+    stratified lake much of the return flow is driven by internal
+    (baroclinic) pressure gradients from a tilting thermocline, which a 1D
+    model cannot resolve.
+
+    `weight` (params["zero_net_transport"], 1 = on, 0 = off) is applied as a
+    multiplier rather than a Python if/else so it can live in `params`
+    alongside traced values without breaking `jax.jit`."""
+    total_area = jnp.sum(area)
+    u_mean = jnp.sum(area * uvel) / total_area
+    v_mean = jnp.sum(area * vvel) / total_area
+    return uvel - weight * u_mean, vvel - weight * v_mean
+
+
+def momentum_step(uvel, vvel, kz, area, dx, dt, Uw_eff, wind_dir_deg, latitude_deg, Cd, rho_0,
+                  ice=False, cd_bottom=0.002, zero_net_transport=1.0):
+    """One step of the momentum equations: wind-stress-forced diffusion
+    (reusing `kz`), then quadratic friction on the basin sides and bottom
+    (`_boundary_friction_step`), then exact Coriolis rotation. See the
+    module-level note above this section for the Prandtl-number-1
+    (nu_t == kz) simplification relative to Goudsmit et al. 2002's full
+    k-eps closure.
+
+    `ice`: no wind stress reaches the water under ice cover -- the surface
+    flux is zeroed and the existing currents only decay by friction (and
+    keep rotating with Coriolis)."""
+    tau_x, tau_y = _wind_stress_components(Uw_eff, wind_dir_deg, Cd)
+    open_water = jnp.where(ice, 0.0, 1.0)
+    tau_x, tau_y = tau_x * open_water, tau_y * open_water
+    uvel, vvel = _momentum_diffusion_step(uvel, vvel, kz, area, dx, dt, tau_x, tau_y, rho_0)
+    uvel, vvel = _boundary_friction_step(uvel, vvel, area, dx, dt, cd_bottom)
+    f = coriolis_parameter(latitude_deg)
+    uvel, vvel = _coriolis_rotate(uvel, vvel, f, dt)
+    # Closed-basin constraint last: Coriolis rotates every layer by the same
+    # angle, so it commutes with removing the depth mean anyway.
+    uvel, vvel = _remove_net_transport(uvel, vvel, area, zero_net_transport)
+    return uvel, vvel
+
+
 def diffusion_step(u, kz, area, dx, dt):
     """Temperature-only part of `diffusion_module_dAdK_v2`. Flux-form
     operator with natural (zero-flux) Neumann boundaries; solved
@@ -798,7 +1284,12 @@ class LakeState(dict):
 
     Missing-key attribute lookups must raise `AttributeError` (not
     `KeyError`) or JAX's internal `hasattr(...)`-style duck typing checks
-    (e.g. for `__jax_array__`) break."""
+    (e.g. for `__jax_array__`) break.
+
+    NOTE: `u` is temperature (inherited naming from the numpy reference),
+    NOT velocity -- the depth-resolved horizontal-velocity fields added for
+    the Goudsmit momentum equations are deliberately named `uvel`/`vvel`
+    instead, to avoid colliding with this field."""
 
     def __getattr__(self, key):
         try:
@@ -816,7 +1307,14 @@ jax.tree_util.register_pytree_node(
 )
 
 
-def make_initial_state(u0, nx, ice=False, Hi=0.0, Hs=0.0, Hsi=0.0, iceT=6.0, rho_snow=250.0):
+def make_initial_state(u0, nx, ice=False, Hi=0.0, Hs=0.0, Hsi=0.0, iceT=6.0, rho_snow=250.0,
+                        uvel0=None, vvel0=None):
+    """`uvel0`/`vvel0`: initial depth-resolved horizontal-velocity profiles
+    (default: lake at rest, i.e. zeros of length `nx`). Named `uvel`/`vvel`
+    rather than `u`/`v` because `u` is already this state's temperature
+    field (see `LakeState`'s docstring note below)."""
+    uvel0 = jnp.zeros(nx, dtype=jnp.float64) if uvel0 is None else jnp.asarray(uvel0, dtype=jnp.float64)
+    vvel0 = jnp.zeros(nx, dtype=jnp.float64) if vvel0 is None else jnp.asarray(vvel0, dtype=jnp.float64)
     return LakeState(
         u=jnp.asarray(u0, dtype=jnp.float64),
         kz=jnp.zeros(nx, dtype=jnp.float64),
@@ -826,6 +1324,11 @@ def make_initial_state(u0, nx, ice=False, Hi=0.0, Hs=0.0, Hsi=0.0, iceT=6.0, rho
         Hsi=jnp.array(float(Hsi)),
         iceT=jnp.array(float(iceT)),
         rho_snow=jnp.array(float(rho_snow)),
+        uvel=uvel0,
+        vvel=vvel0,
+        # Total basin-scale seiche energy [J] (seiche_energy_step); starts
+        # at 0 (lake at rest) and spins up within days of wind forcing.
+        E_seiche=jnp.array(0.0, dtype=jnp.float64),
     )
 
 
@@ -864,14 +1367,22 @@ def temperature_step(state, forcing, geometry, params):
     )
 
     dens_u = calc_dens(u)
-    kz = eddy_diffusivity_hendersonSellers(
+    E_seiche, seiche = _seiche_inputs(state, Uw_eff, area, volume, dx, dt, ice, params)
+    kz = compute_eddy_diffusivity(
+        params["diffusion_method"],
         # NOTE: the reference's `run_wq_model` calls this with a hardcoded
         # latitude (43.100948) instead of the lake's configured latitude,
         # in every diffusion_method branch (line 4572) -- reproduced here
         # rather than "fixed" to `geometry["latitude"]`, since the goal is
-        # a numerically matching port.
+        # a numerically matching port. The "richardson" closure below has
+        # no such numeric-matching requirement (it has no numpy reference),
+        # so it is passed `geometry["latitude"]` directly -- it is only read
+        # by `eddy_diffusivity_hendersonSellers()`'s own branch, though, so
+        # this doesn't affect "hendersonSellers"'s bit-exactness either way.
         dens_u, depth, params["g"], jnp.mean(dens_u), ice, Uw_eff, geometry["latitude"], u,
         state.kz, params["Cd"], params["km"], params["weight_kz"],
+        state.uvel, state.vvel, params["k_min"], params["k_max"], params["alpha"], params["n"],
+        seiche=seiche,
     )
 
     u = diffusion_step(u, kz, area, dx, dt)
@@ -879,7 +1390,17 @@ def temperature_step(state, forcing, geometry, params):
                         W_str=params["W_str"])
     u = convection_step(u, volume, denThresh=params["denThresh"], max_outer=params["max_conv_passes"])
 
-    new_state = LakeState(u=u, kz=kz, ice=ice, Hi=Hi, Hs=Hs, Hsi=Hsi, iceT=iceT, rho_snow=rho_snow)
+    # Momentum (uvel/vvel): wind-stress + Coriolis, reusing this step's own
+    # `kz` as the momentum eddy viscosity -- see the module note above
+    # `momentum_step()`.
+    uvel, vvel = momentum_step(
+        state.uvel, state.vvel, kz, area, dx, dt, Uw_eff, forcing["WindDir"],
+        geometry["latitude"], params["Cd"], jnp.mean(dens_u),
+        ice=ice, cd_bottom=params["Cd_bottom"], zero_net_transport=params["zero_net_transport"],
+    )
+
+    new_state = LakeState(u=u, kz=kz, ice=ice, Hi=Hi, Hs=Hs, Hsi=Hsi, iceT=iceT, rho_snow=rho_snow,
+                           uvel=uvel, vvel=vvel, E_seiche=E_seiche)
     return new_state
 
 
@@ -1219,8 +1740,9 @@ def prodcons_step(u, o2, docr, docl, pocr, pocl, volume, npp, dt, theta_r, k_hal
 
 
 def make_initial_state_full(u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, nx, ice=False, Hi=0.0, Hs=0.0, Hsi=0.0,
-                             iceT=6.0, rho_snow=250.0):
-    state = make_initial_state(u0, nx, ice=ice, Hi=Hi, Hs=Hs, Hsi=Hsi, iceT=iceT, rho_snow=rho_snow)
+                             iceT=6.0, rho_snow=250.0, uvel0=None, vvel0=None):
+    state = make_initial_state(u0, nx, ice=ice, Hi=Hi, Hs=Hs, Hsi=Hsi, iceT=iceT, rho_snow=rho_snow,
+                                uvel0=uvel0, vvel0=vvel0)
     state["o2"] = jnp.asarray(o2_0, dtype=jnp.float64)
     state["docr"] = jnp.asarray(docr_0, dtype=jnp.float64)
     state["docl"] = jnp.asarray(docl_0, dtype=jnp.float64)
@@ -1324,14 +1846,19 @@ def full_step(state, forcing, geometry, params, kz_override=None):
 
     # 7. eddy diffusivity
     dens_u = calc_dens(u)
-    kz_process, ri_process = eddy_diffusivity_hendersonSellers(
+    E_seiche, seiche = _seiche_inputs(state, Uw_eff, area, volume, dx, dt, ice, params)
+    kz_process, ri_process = compute_eddy_diffusivity(
+        params["diffusion_method"],
         # NOTE: the reference's `run_wq_model` calls this with a hardcoded
         # latitude (43.100948) instead of the lake's configured latitude,
         # in every diffusion_method branch (line 4572) -- reproduced here
         # rather than "fixed" to `geometry["latitude"]`, since the goal is
-        # a numerically matching port.
+        # a numerically matching port (only applies to the "hendersonSellers"
+        # branch -- see compute_eddy_diffusivity()'s docstring).
         dens_u, depth, params["g"], jnp.mean(dens_u), ice, Uw_eff, geometry["latitude"], u,
-        state.kz, params["Cd"], params["km"], params["weight_kz"], return_ri=True,
+        state.kz, params["Cd"], params["km"], params["weight_kz"],
+        state.uvel, state.vvel, params["k_min"], params["k_max"], params["alpha"], params["n"],
+        return_ri=True, seiche=seiche,
     )
     if kz_override is None:
         kz = kz_process
@@ -1379,8 +1906,23 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     pocr = pocr * (1 - outflow_frac)
     pocl = pocl * (1 - outflow_frac)
 
+    # Momentum (uvel/vvel): wind-stress + Coriolis, reusing this step's own
+    # `kz` (process-based or kz_override'd) as the momentum eddy viscosity --
+    # see the module note above `momentum_step()`.
+    uvel, vvel = momentum_step(
+        state.uvel, state.vvel, kz, area, dx, dt, Uw_eff, forcing["WindDir"],
+        geometry["latitude"], params["Cd"], jnp.mean(dens_u),
+        ice=ice, cd_bottom=params["Cd_bottom"], zero_net_transport=params["zero_net_transport"],
+    )
+
+    # Key order must match make_initial_state_full()'s (u,kz,ice,Hi,Hs,Hsi,
+    # iceT,rho_snow,uvel,vvel,o2,docr,docl,pocr,pocl) -- LakeState's pytree
+    # registration uses dict insertion order, and `lax.scan` requires the
+    # carry's pytree structure (incl. key order) to stay identical between
+    # the initial carry and every step's output.
     new_state = LakeState(
         u=u, kz=kz, ice=ice, Hi=Hi, Hs=Hs, Hsi=Hsi, iceT=iceT, rho_snow=rho_snow,
+        uvel=uvel, vvel=vvel, E_seiche=E_seiche,
         o2=o2, docr=docr, docl=docl, pocr=pocr, pocl=pocl,
     )
     diagnostics = dict(
@@ -1416,7 +1958,7 @@ def run_full_model(u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, forcing_series, geo
     meteorology, see `run_M3_jax.py`).
 
     Returns (final_state, per_step) where `per_step` is a dict with keys
-    u, o2, docr, docl, pocr, pocl (each shape (n_steps, nx)).
+    u, o2, docr, docl, pocr, pocl, uvel, vvel (each shape (n_steps, nx)).
     """
     nx = u0.shape[0]
     ice_state = ice_state or {}
@@ -1427,6 +1969,7 @@ def run_full_model(u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, forcing_series, geo
         outputs = dict(
             u=new_state.u, o2=new_state.o2, docr=new_state.docr, docl=new_state.docl,
             pocr=new_state.pocr, pocl=new_state.pocl,
+            uvel=new_state.uvel, vvel=new_state.vvel,
         )
         return new_state, outputs
 
@@ -1434,11 +1977,20 @@ def run_full_model(u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, forcing_series, geo
     return final_state, per_step
 
 
-def default_params(model_params: dict, ice_and_snow: dict = None) -> dict:
+def default_params(model_params: dict, ice_and_snow: dict = None,
+                    diffusion_method: str = "hendersonSellers") -> dict:
     """Build the `params` dict `temperature_step`/`run_temperature_model`
     expect, from a Lake-M3 `model_params` row (as returned by
     `get_model_params()` in the numpy code) plus the ice/snow config row
-    (as returned by `get_ice_and_snow()`, for `dt_iceon_avg`/`Ice_min`)."""
+    (as returned by `get_ice_and_snow()`, for `dt_iceon_avg`/`Ice_min`).
+
+    `diffusion_method`: which eddy-diffusivity closure `temperature_step`/
+    `full_step` use (see `compute_eddy_diffusivity()`) -- "hendersonSellers"
+    (default) or "richardson". Read from `run_config.csv`'s own
+    `diffusion_method` column by every caller of this function (the same
+    column the numpy reference's `run_wq_model` already reads), not from
+    `model_params`/`ice_and_snow` -- passed in by the caller explicitly
+    rather than looked up from either of those two dicts."""
     import math
 
     if ice_and_snow is None:
@@ -1488,6 +2040,31 @@ def default_params(model_params: dict, ice_and_snow: dict = None) -> dict:
         g=float(model_params["g"]),
         km=float(model_params["km"]),
         weight_kz=float(model_params["weight_kz"]),
+        # eddy_diffusivity()'s own Ri=N2/S2 stability-function parameters --
+        # independent of the Henderson-Sellers closure above, not read by it.
+        # `.get(..., default)` rather than a bare subscript so pre-existing
+        # model_params.csv files without these rows still load (see this
+        # project's established pattern for e.g. `oc_load_factor` above).
+        k_min=float(model_params.get("k_min", 1.4e-7)),
+        k_max=float(model_params.get("k_max", 1e-2)),
+        alpha=float(model_params.get("alpha", 10.0)),
+        n=float(model_params.get("n", 1.5)),
+        # Drag coefficient for friction on the basin sides/bottom in the
+        # momentum equations (see _boundary_friction_step); 0.002 is
+        # Goudsmit et al. (2002)'s effective bottom drag coefficient.
+        Cd_bottom=float(model_params.get("Cd_bottom", 0.002)),
+        # Closed-basin zero-net-transport constraint on the momentum
+        # equations (see _remove_net_transport): 1 = on (default), 0 = off.
+        zero_net_transport=float(model_params.get("zero_net_transport", 1.0)),
+        # "richardson_seiche" closure (see eddy_diffusivity_richardson_seiche):
+        # fraction of wind energy going into basin-scale seiches (Goudsmit et
+        # al. 2002 calibrated 1.7e-3 to 6.3e-3), Osborn mixing efficiency, and
+        # the density step / transition width defining the surface layer.
+        seiche_alpha=float(model_params.get("seiche_alpha", 2e-3)),
+        mixing_efficiency=float(model_params.get("mixing_efficiency", 0.2)),
+        sbl_drho=float(model_params.get("sbl_drho", 0.05)),
+        sbl_width=float(model_params.get("sbl_width", 0.01)),
+        diffusion_method=str(diffusion_method),
         W_str=(None if w_str_is_nan else float(w_str_raw)),
         denThresh=float(model_params["denThresh"]),
         max_conv_passes=None,  # defaults to nx inside convection_step

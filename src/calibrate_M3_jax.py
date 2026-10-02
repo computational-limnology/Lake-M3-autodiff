@@ -260,6 +260,39 @@ DEFAULT_EARLY_STOP_TOL = 1e-4     # relative loss improvement below this doesn't
 DEFAULT_TOPK = 6
 DEFAULT_TOPK_PER_VARIABLE = 5
 
+# Per-parameter multipliers on the log-space Adam step (--lr) and on the
+# allowed search range (default: 0.1x-10x of the initial value). Every
+# parameter is already optimized as log(value), but with one shared --lr
+# each moves by roughly the same ~5% per iteration, so a 20-iteration run
+# can change any parameter by at most ~e^1 = 2.7x. That is fine for factors
+# near 1 (sw_factor, wind_factor, ...) but too slow for diffusivity bounds
+# that are only known to within orders of magnitude: k_min (molecular,
+# ~1e-7) and k_max (fully turbulent, ~1e-4..1e-2 m2/s). A step multiplier
+# of 5 gives ~25% per iteration (~1 decade in ~10 iterations), and a bound
+# factor of 100 lets them move two decades either way. Adam normalizes the
+# gradient magnitude away, so scaling the gradient would do nothing --
+# the multiplier is applied to Adam's *update* instead (see main()).
+# Override or extend from the command line with --lr-scale / --bound-factor.
+DEFAULT_PARAM_LR_SCALE = {"k_min": 5.0, "k_max": 5.0, "seiche_alpha": 5.0}
+DEFAULT_PARAM_BOUND_FACTOR = {"k_min": 100.0, "k_max": 100.0, "seiche_alpha": 100.0}
+DEFAULT_BOUND_FACTOR = 10.0
+
+
+def parse_name_value_list(text, what):
+    """Parse 'name=value,name=value' into {name: float(value)}."""
+    out = {}
+    if not text:
+        return out
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(f"{what}: expected name=value, got {item!r}")
+        name, value = item.split("=", 1)
+        out[name.strip()] = float(value)
+    return out
+
 # model_params.csv entries that default_params() actually threads into the
 # simulation, restricted to ones that are safe/sensible to tweak in
 # isolation. Excluded: physical constants (g, sigma), the OC-partitioning
@@ -277,7 +310,8 @@ CANDIDATE_PARAMS = [
     "theta_r", "theta_npp", "k_half",
     "resp_docr", "resp_docl", "resp_pocr", "resp_pocl",
     "settling_rate_labile", "settling_rate_refractory",
-    "f_sod", "d_thick", "meltP", "oc_load_factor",
+    "f_sod", "d_thick", "meltP", "oc_load_factor", "k_min", "k_max", "alpha", "n", "Cd_bottom",
+    "seiche_alpha", "sbl_drho"
 ]
 
 
@@ -656,6 +690,15 @@ def main():
     parser.add_argument("--iters", type=int, default=DEFAULT_ITERS,
                          help="maximum Adam iterations (may stop earlier -- see --early-stop-patience)")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR, help="log-space Adam learning rate")
+    parser.add_argument("--lr-scale", type=str, default=None,
+                         help="per-parameter multipliers on the log-space step, e.g. "
+                              "'k_min=5,k_max=5,alpha=2' (merged over the defaults "
+                              f"{DEFAULT_PARAM_LR_SCALE}; use name=1 to switch a default off)")
+    parser.add_argument("--bound-factor", type=str, default=None,
+                         help="per-parameter search range as a factor either side of the initial "
+                              "value, e.g. 'k_min=100,k_max=100' (merged over the defaults "
+                              f"{DEFAULT_PARAM_BOUND_FACTOR}; all other parameters use "
+                              f"{DEFAULT_BOUND_FACTOR:g}x)")
     parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE,
                          help=f"stop the Adam loop once this many consecutive iterations fail to "
                               f"improve the loss by more than --early-stop-tol (default "
@@ -731,7 +774,10 @@ def main():
         altitude=float(lake_config["Elevation"]), hypso_weight=hypso_weight, mean_depth=mean_depth,
         hydro_res_time_hr=hydro_res_time_hr,
     )
-    base_params = default_params(model_params, ice_and_snow)
+    base_params = default_params(
+        model_params, ice_and_snow,
+        diffusion_method=str(run_config.get("diffusion_method", "hendersonSellers")),
+    )
 
     def _to_bool(x):
         if isinstance(x, str):
@@ -908,8 +954,26 @@ def main():
 
     theta_log = {name: theta_log0[name] for name in selected}
     x0 = {name: float(base_params[name]) for name in selected}
-    log_lo = {name: jnp.log(jnp.asarray(min(0.1 * x0[name], 10 * x0[name]))) for name in selected}
-    log_hi = {name: jnp.log(jnp.asarray(max(0.1 * x0[name], 10 * x0[name]))) for name in selected}
+    lr_scale = dict(DEFAULT_PARAM_LR_SCALE)
+    lr_scale.update(parse_name_value_list(args.lr_scale, "--lr-scale"))
+    bound_factor = dict(DEFAULT_PARAM_BOUND_FACTOR)
+    bound_factor.update(parse_name_value_list(args.bound_factor, "--bound-factor"))
+    unknown = sorted((set(lr_scale) | set(bound_factor)) - set(CANDIDATE_PARAMS))
+    if unknown:
+        raise SystemExit(f"--lr-scale/--bound-factor name(s) not in CANDIDATE_PARAMS: {unknown}")
+    # Bounds are symmetric in log space: [x0/B, x0*B]. log(x0) +- log(B)
+    # (rather than min/max of the two products) also handles the
+    # theoretically-possible negative initial value the old code guarded
+    # against, since theta_log0 is only defined for x0 > 0 anyway.
+    log_lo = {name: theta_log0[name] - jnp.log(bound_factor.get(name, DEFAULT_BOUND_FACTOR)) for name in selected}
+    log_hi = {name: theta_log0[name] + jnp.log(bound_factor.get(name, DEFAULT_BOUND_FACTOR)) for name in selected}
+    step_scale = {name: lr_scale.get(name, 1.0) for name in selected}
+    scaled = {n: (step_scale[n], bound_factor.get(n, DEFAULT_BOUND_FACTOR)) for n in selected
+              if step_scale[n] != 1.0 or bound_factor.get(n, DEFAULT_BOUND_FACTOR) != DEFAULT_BOUND_FACTOR}
+    if scaled:
+        print("  per-parameter log-step multiplier / search range (x either side of initial):")
+        for n, (s, b) in scaled.items():
+            print(f"    {n:16s} step x{s:g} (~{100 * (np.exp(args.lr * s) - 1):.0f}% per iteration), range {b:g}x")
 
     opt = optax.adam(args.lr)
     opt_state = opt.init(theta_log)
@@ -933,7 +997,15 @@ def main():
                   "(see jax_lakeModel_functions.py's module docstring on the gradient horizon; "
                   "try a smaller --chunk-steps). Keeping the best result found so far.")
             break
+        # `loss_val` was evaluated at the parameters *before* this update --
+        # keep a copy so "best" refers to parameters that were actually
+        # scored, not the untested ones one step further along.
+        theta_evaluated = dict(theta_log)
         updates, opt_state = opt.update(grads, opt_state, theta_log)
+        # Per-parameter step multiplier (see DEFAULT_PARAM_LR_SCALE) --
+        # applied to Adam's update, since Adam itself is invariant to
+        # rescaling the gradient.
+        updates = {name: u * step_scale[name] for name, u in updates.items()}
         theta_log = optax.apply_updates(theta_log, updates)
         theta_log = {name: jnp.clip(v, log_lo[name], log_hi[name]) for name, v in theta_log.items()}
         t1 = time.time()
@@ -944,7 +1016,7 @@ def main():
         # step improve on the previous one" (which would be noisy with Adam).
         improved_enough = (best_loss - loss_f) > args.early_stop_tol * max(abs(best_loss), 1e-12)
         if loss_f < best_loss:
-            best_loss, best_theta_log = loss_f, dict(theta_log)
+            best_loss, best_theta_log = loss_f, theta_evaluated
         print(f"  iter {it:3d}: loss={loss_f:.6g}  ({t1 - t0:.1f}s)")
         if args.early_stop_patience > 0:
             if improved_enough:
@@ -977,11 +1049,31 @@ def main():
     # dtypes are identical for the initial and calibrated parameter sets
     # (only the values differ), so the second call is a compiled-cache
     # hit rather than a second full compile of the whole simulation.
-    sim_fn = jax.jit(
-        lambda p: simulate_truncated(p, geometry, forcing, ice_state, init_state, args.chunk_steps)
-    )
-    metrics_initial = compute_metrics(sim_fn, base_params, obs)
-    metrics_final = compute_metrics(sim_fn, params_final, obs)
+    #
+    # `diffusion_method` (a plain Python string, added by default_params()
+    # for the hendersonSellers/richardson switch -- see
+    # jax_lakeModel_functions.compute_eddy_diffusivity()) is stripped out of
+    # the dict actually passed to `jax.jit` below and re-attached inside the
+    # wrapped function from a closed-over constant instead. `jax.jit` traces
+    # every leaf of its argument pytree as an abstract array; a string leaf
+    # makes it raise "Error interpreting argument ... as an abstract array"
+    # (every other params entry is a plain float, so this never surfaced
+    # before `diffusion_method` existed). The two call sites below already
+    # guarantee this is the same fixed string both times (the run's own
+    # `diffusion_method` never changes between the initial and calibrated
+    # parameter sets), so closing over it is exact, not an approximation.
+    diffusion_method = base_params["diffusion_method"]
+
+    def _sim_fn(p):
+        p = dict(p)
+        p["diffusion_method"] = diffusion_method
+        return simulate_truncated(p, geometry, forcing, ice_state, init_state, args.chunk_steps)
+
+    sim_fn = jax.jit(_sim_fn)
+    base_params_sim = {k: v for k, v in base_params.items() if k != "diffusion_method"}
+    params_final_sim = {k: v for k, v in params_final.items() if k != "diffusion_method"}
+    metrics_initial = compute_metrics(sim_fn, base_params_sim, obs)
+    metrics_final = compute_metrics(sim_fn, params_final_sim, obs)
     print_metrics_table(
         "Evaluation metrics (computed at the same (step, depth) pairs the loss scores; "
         "NSE/KGE/R2: 1.0 = perfect fit):",

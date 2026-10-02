@@ -439,6 +439,7 @@ def simulate_baseline(phys_params, geometry, forcing, ice_state, init_state):
             u=new_state.u, kz=new_state.kz,
             o2=new_state.o2, docr=new_state.docr, docl=new_state.docl,
             pocr=new_state.pocr, pocl=new_state.pocl,
+            uvel=new_state.uvel, vvel=new_state.vvel, E_seiche=new_state.E_seiche,
         )
         return new_state, outputs
 
@@ -565,6 +566,7 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
             u=new_state.u, o2=new_state.o2, docr=new_state.docr, docl=new_state.docl,
             pocr=new_state.pocr, pocl=new_state.pocl,
             kz=new_state.kz, kz_process=diag["kz_process"],
+            uvel=new_state.uvel, vvel=new_state.vvel, E_seiche=new_state.E_seiche,
         )
         if target == "ri":
             dens_new = calc_dens(new_state.u)
@@ -839,7 +841,10 @@ def main():
         altitude=float(lake_config["Elevation"]), hypso_weight=hypso_weight, mean_depth=mean_depth,
         hydro_res_time_hr=hydro_res_time_hr,
     )
-    phys_params = default_params(model_params, ice_and_snow)
+    phys_params = default_params(
+        model_params, ice_and_snow,
+        diffusion_method=str(run_config.get("diffusion_method", "hendersonSellers")),
+    )
 
     def _to_bool(x):
         if isinstance(x, str):
@@ -889,8 +894,24 @@ def main():
     # --- baseline (process-based) run ---
     print("\nRunning baseline (process-based kz) simulation...")
     t0 = time.time()
-    baseline_fn = jax.jit(lambda p: simulate_baseline(p, geometry, forcing, ice_state, init_state))
-    baseline = baseline_fn(phys_params)
+    # `diffusion_method` (a plain Python string -- see default_params()/
+    # compute_eddy_diffusivity() in jax_lakeModel_functions.py) is stripped
+    # out of the dict passed to `jax.jit` and re-attached from a closed-over
+    # constant inside `_baseline_fn` instead: `jax.jit` traces every leaf of
+    # its argument pytree as an abstract array, and a string leaf makes it
+    # raise "Error interpreting argument ... as an abstract array" (every
+    # other phys_params entry is a plain float, so this never surfaced
+    # before `diffusion_method` existed).
+    diffusion_method = phys_params["diffusion_method"]
+
+    def _baseline_fn(p):
+        p = dict(p)
+        p["diffusion_method"] = diffusion_method
+        return simulate_baseline(p, geometry, forcing, ice_state, init_state)
+
+    baseline_fn = jax.jit(_baseline_fn)
+    phys_params_sim = {k: v for k, v in phys_params.items() if k != "diffusion_method"}
+    baseline = baseline_fn(phys_params_sim)
     jax.block_until_ready(baseline)
     print(f"  done in {time.time() - t0:.1f}s")
 
@@ -1098,6 +1119,9 @@ def main():
         docl_baseline=np.asarray(baseline["docl"]), docl_hybrid=np.asarray(hybrid["docl"]),
         pocr_baseline=np.asarray(baseline["pocr"]), pocr_hybrid=np.asarray(hybrid["pocr"]),
         pocl_baseline=np.asarray(baseline["pocl"]), pocl_hybrid=np.asarray(hybrid["pocl"]),
+        uvel_baseline=np.asarray(baseline["uvel"]), uvel_hybrid=np.asarray(hybrid["uvel"]),
+        vvel_baseline=np.asarray(baseline["vvel"]), vvel_hybrid=np.asarray(hybrid["vvel"]),
+        E_seiche_baseline=np.asarray(baseline["E_seiche"]), E_seiche_hybrid=np.asarray(hybrid["E_seiche"]),
         train_lo=train_lo, train_hi=train_hi, test_lo=test_lo, test_hi=test_hi,
         # raw meteorological wind speed (lake_config.csv's WindSpeed factor
         # already applied, same series the model itself is driven by, before
