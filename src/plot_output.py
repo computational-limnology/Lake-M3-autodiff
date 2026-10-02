@@ -611,9 +611,13 @@ def _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume=None, s
     # fields saved by run_M3_jax.py/run_M3_mcl_jax.py; absent entirely from
     # any output file produced before that addition, so this is skipped
     # (not an error) when either field is missing.
-    if "uvel" in res and "vvel" in res:
-        uvel = to_numpy(res["uvel"])
-        vvel = to_numpy(res["vvel"])
+    # Resolved like the other fields, so train_M3_mcl_jax.py's
+    # uvel_baseline/uvel_hybrid pairs work too (--series picks which).
+    ukey = _resolve_series_key(res, "uvel", series)
+    vkey = _resolve_series_key(res, "vvel", series)
+    if ukey is not None and vkey is not None:
+        uvel = to_numpy(res[ukey])
+        vvel = to_numpy(res[vkey])
         uvel, _, _ = _apply_orientation(uvel, time_values, depth_values)
         vvel, _, _ = _apply_orientation(vvel, time_values, depth_values)
         arrays["speed"] = np.sqrt(uvel ** 2 + vvel ** 2)

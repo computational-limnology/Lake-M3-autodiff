@@ -552,10 +552,17 @@ def seiche_energy_step(E, Uw_eff, area, volume, dt, ice, seiche_alpha, c10, cd_b
     the momentum equations). The paper reports a seiche-energy half-life of
     about 3 days with these values.
 
-    Solved semi-implicitly, E_new = (E + dt*P) / (1 + dt*gamma*sqrt(E)), so
-    E stays positive for any dt and the E**1.5 loss can't overshoot.
-    Returns (E_new, loss_rate [W]) -- the loss over this step, evaluated at
-    E_new, which `seiche_interior_diffusivity` turns into mixing."""
+    Solved semi-implicitly by splitting the loss as gamma*sqrt(E) [old
+    level] * E [new level]:
+
+        E_new - E = dt*P - dt*gamma*sqrt(E)*E_new
+        =>  E_new = (E + dt*P) / (1 + dt*gamma*sqrt(E))
+
+    so E stays positive for any dt and the E**1.5 loss can't overshoot.
+    Returns (E_new, loss_rate [W]). The loss rate is the one the step
+    actually applied, gamma*sqrt(E)*E_new, so the energy removed from the
+    budget (dt*loss) is exactly the energy handed to
+    `seiche_interior_diffusivity` -- the budget closes."""
     A0 = area[0]
     V = jnp.sum(volume)
     open_water = jnp.where(ice, 0.0, 1.0)
@@ -563,7 +570,7 @@ def seiche_energy_step(E, Uw_eff, area, volume, dt, ice, seiche_alpha, c10, cd_b
     gamma = cd_bottom * A0 * V ** (-1.5) * rho_0 ** (-0.5)
     sqrt_E = jnp.sqrt(E + _SEICHE_E_EPS)
     E_new = (E + dt * P_in) / (1.0 + dt * gamma * sqrt_E)
-    loss = gamma * E_new * jnp.sqrt(E_new + _SEICHE_E_EPS)
+    loss = gamma * sqrt_E * E_new
     return E_new, loss
 
 

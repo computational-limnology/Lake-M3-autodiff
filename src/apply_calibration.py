@@ -32,6 +32,19 @@ import shutil
 import pandas as pd
 
 
+# Parameters that default_params() (jax_lakeModel_functions.py) divides by
+# 86400 when reading model_params.csv: the CSV holds them per day, the model
+# (and therefore calibrate_M3_jax.py's calibration_result.csv) per second.
+# Writing a calibrated value back without converting would store a per-second
+# number in a per-day column, and the next run would divide it by 86400
+# again -- e.g. resp_pocl 1.89e-6 s^-1 becoming an effective 2.2e-11 s^-1.
+PER_DAY_IN_CSV = {
+    "resp_docr", "resp_docl", "resp_pocr", "resp_pocl",
+    "settling_rate_labile", "settling_rate_refractory",
+}
+SECONDS_PER_DAY = 86400.0
+
+
 def _is_numeric(cell):
     try:
         float(cell)
@@ -80,7 +93,10 @@ def update_model_params_from_calibration(model_params_file, calibration_result_f
     for name, result_row in cal_df.iterrows():
         row = row_by_name[name]
         old = row[col_idx]
-        new = str(result_row["calibrated"])
+        value = float(result_row["calibrated"])
+        if name in PER_DAY_IN_CSV:
+            value *= SECONDS_PER_DAY  # model units (per second) -> CSV units (per day)
+        new = repr(value)
         if old.strip() != new:
             changes.append((name, old, new))
         row[col_idx] = new

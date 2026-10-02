@@ -333,6 +333,28 @@ FORCING_FEATURE_KEYS = ["Tair", "CC", "ea", "Jsw", "Jlw", "Uw", "Pa", "RH", "PP"
 N_DYNAMIC_FEATURES = 7
 N_FEATURES = len(FORCING_FEATURE_KEYS) + N_DYNAMIC_FEATURES
 
+# --feature-set: "basic" = the 16 inputs above (what every pickle saved
+# before this option existed was trained with); "extended" adds five
+# physically-based lake indices (see lake_physics_features): mixed-layer
+# depth, Schmidt stability, Lake Number, surface buoyancy flux and seiche
+# energy.
+FEATURE_SETS = ("basic", "extended")
+N_EXTENDED_FEATURES = 5
+DEFAULT_FEATURE_SET = "extended"
+
+# --depth-coord (--target kz only): the coordinate the polynomial
+# log-correction is expressed in. "absolute" = depth / max depth (the
+# original form; default for pickles saved before this option existed);
+# "mixed_layer" = depth relative to the current mixed-layer depth h (see
+# mixed_layer_basis), so the same coefficients keep meaning "just below the
+# mixed layer" as the thermocline moves through the season.
+DEPTH_COORDS = ("absolute", "mixed_layer")
+DEFAULT_DEPTH_COORD = "mixed_layer"
+
+
+def n_features(feature_set):
+    return N_FEATURES + (N_EXTENDED_FEATURES if feature_set == "extended" else 0)
+
 
 # ---------------------------------------------------------------------------
 # The correction network: a single LSTM cell + a linear head. For
@@ -366,13 +388,13 @@ def _constant_bias_init(values):
     return init_fn
 
 
-def init_nn_params(key, hidden_size, output_size, bias_init=None):
+def init_nn_params(key, hidden_size, output_size, bias_init=None, n_feat=N_FEATURES):
     lstm, head = make_modules(hidden_size, output_size)
     if bias_init is not None:
         head = head.clone(bias_init=bias_init)
     k_lstm, k_head = jax.random.split(key)
-    carry0 = lstm.initialize_carry(k_lstm, (N_FEATURES,))
-    x0 = jnp.zeros((N_FEATURES,), dtype=jnp.float64)
+    carry0 = lstm.initialize_carry(k_lstm, (n_feat,))
+    x0 = jnp.zeros((n_feat,), dtype=jnp.float64)
     lstm_params = lstm.init(k_lstm, carry0, x0)
     (_, _), y0 = lstm.apply(lstm_params, carry0, x0)
     head_params = head.init(k_head, y0)
@@ -404,6 +426,84 @@ def compute_density_gradient_features(u, depth, g):
     depth_norm = depth / jnp.max(depth)
     thermocline_loc = depth_norm[jnp.argmax(diff_rho)]
     return jnp.array([bulk, peak, thermocline_loc])
+
+
+_RHO_AIR = 1.225   # kg m-3
+_CP_WATER = 4186.0  # J kg-1 K-1
+_USTAR_FLOOR = 1e-4  # m s-1 -- keeps the Lake Number finite in calm conditions and under ice
+
+
+def mixed_layer_depth(dens, dx, sbl_drho, sbl_width):
+    """Smooth surface mixed-layer depth h [m]: the summed thickness of layers
+    whose density is within `sbl_drho` of the surface density, using the same
+    sigmoid weight as the richardson_seiche closure (`surface_layer_weight`)
+    so h stays differentiable. Floored at one layer thickness."""
+    w = jax.nn.sigmoid((dens[0] + sbl_drho - dens) / sbl_width)
+    return jnp.maximum(jnp.sum(w) * dx, dx)
+
+
+def mixed_layer_basis(depth, h, depth_basis_degree):
+    """`(degree+1, nx)` basis in a thermocline-relative coordinate. With
+    zeta = z/h, eta = zeta/(1+zeta) maps [0, inf) to [0, 1) with eta = 0.5 at
+    the mixed-layer base; x = 2*eta - 1 then lies in [-1, 1) with x = 0 at the
+    mixed-layer base, x < 0 inside the mixed layer and x -> 1 deep below it.
+    Returns x**k for k = 0..degree, combined with the network's coefficients
+    exactly like `build_depth_basis` is."""
+    zeta = depth / h
+    x = 2.0 * zeta / (1.0 + zeta) - 1.0
+    return jnp.stack([x ** k for k in range(depth_basis_degree + 1)], axis=0)
+
+
+def lake_physics_features(u, E_seiche, q_net_prev, Uw_eff, area, volume, depth, dx, params):
+    """Five lake indices for --feature-set extended, each scaled to roughly
+    O(1) for the network:
+
+    - h / z_max: mixed-layer depth relative to max depth (`mixed_layer_depth`).
+    - Schmidt stability S = (g/A0) sum_i (z_i - z_v) rho_i V_i [J m-2]
+      (Idso 1973), z_v the centre-of-volume depth; the energy needed to mix
+      the lake completely. Feature: log10(S + 1) / 4.
+    - Lake Number L_N = S (1 - z_T/z_D) / (rho_0 u*^2 sqrt(A0) (1 - z_v/z_D))
+      (Imberger & Patterson 1990), the ratio of the stratification's
+      resistance to wind-driven tilting; L_N < ~1 means wind can bring
+      deep water to the surface. z_T is approximated by the N2-weighted mean
+      depth, u* = sqrt(rho_air Cd W^2 / rho_0) is set to its floor under ice.
+      Feature: log10(clip(L_N, 1e-3, 1e5)) / 5.
+    - Surface buoyancy flux B0 = g alpha_T Q_net / (rho_0 c_p) [m2 s-3], from
+      the previous step's net surface heat flux; positive = warming
+      (stabilizing), negative = cooling (convective). Feature: asinh(B0/1e-8)/5.
+    - Seiche energy E [J] (the model state E_seiche). Feature: log10(E+1)/10.
+    """
+    g = params["g"]
+    dens = calc_dens(u)
+    rho_0 = jnp.mean(dens)
+    A0 = area[0]
+    z_D = jnp.max(depth)
+    vol = volume
+    z_v = jnp.sum(depth * vol) / jnp.sum(vol)
+
+    h = mixed_layer_depth(dens, dx, params["sbl_drho"], params["sbl_width"])
+
+    schmidt = jnp.maximum(g / A0 * jnp.sum((depth - z_v) * dens * vol), 0.0)
+
+    N2 = jnp.abs(dens[1:] - dens[:-1]) / (depth[1:] - depth[:-1]) * g / rho_0
+    zmid = 0.5 * (depth[1:] + depth[:-1])
+    z_T = jnp.sum(zmid * N2) / (jnp.sum(N2) + 1e-12)
+    tau = _RHO_AIR * params["Cd"] * Uw_eff ** 2
+    ustar = jnp.maximum(jnp.sqrt(tau / rho_0 + 1e-12), _USTAR_FLOOR)
+    lake_number = (schmidt * (1.0 - z_T / z_D)
+                   / (rho_0 * ustar ** 2 * jnp.sqrt(A0) * (1.0 - z_v / z_D)))
+
+    T0 = u[0]
+    alpha_T = -(calc_dens(jnp.atleast_1d(T0 + 0.01)) - calc_dens(jnp.atleast_1d(T0 - 0.01)))[0] / (0.02 * dens[0])
+    B0 = g * alpha_T * q_net_prev / (rho_0 * _CP_WATER)
+
+    return jnp.array([
+        h / z_D,
+        jnp.log10(schmidt + 1.0) / 4.0,
+        jnp.log10(jnp.clip(lake_number, 1e-3, 1e5)) / 5.0,
+        jnp.arcsinh(B0 / 1e-8) / 5.0,
+        jnp.log10(E_seiche + 1.0) / 10.0,
+    ]), h
 
 
 def build_forcing_features(forcing, train_lo, train_hi):
@@ -461,7 +561,8 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
                      max_log_k0=DEFAULT_MAX_LOG_K0, max_log_alpha=DEFAULT_MAX_LOG_ALPHA,
                      max_log_n=DEFAULT_MAX_LOG_N,
                      ri_alpha_init=DEFAULT_RI_ALPHA_INIT, ri_n_init=DEFAULT_RI_N_INIT,
-                     ri_memory_hours=DEFAULT_RI_MEMORY_HOURS):
+                     ri_memory_hours=DEFAULT_RI_MEMORY_HOURS,
+                     depth_coord="absolute", feature_set="basic"):
     output_size = (depth_basis_degree + 1) if target == "kz" else 3
     lstm, head = make_modules(hidden_size, output_size)
 
@@ -469,7 +570,10 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
     nx = u0.shape[0]
     state0 = make_initial_state_full(u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, nx, **ice_state)
     depth = geometry["depth"]
-    depth_powers = build_depth_basis(depth, depth_basis_degree) if target == "kz" else None
+    depth_powers = (build_depth_basis(depth, depth_basis_degree)
+                    if target == "kz" and depth_coord == "absolute" else None)
+    area, volume, dx = geometry["area"], geometry["volume"], geometry["dx"]
+    q0 = jnp.asarray(0.0, dtype=jnp.float64)  # previous step's net surface heat flux (B0 feature)
 
     # `--target ri` only: e-folding decay per step for the alpha/n EMA (see
     # the module-level DEFAULT_RI_MEMORY_HOURS comment). `geometry["dt"]` is
@@ -507,9 +611,9 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
     @jax.checkpoint
     def step_body(carry, forcing_t):
         if target == "ri":
-            state, h, c, log_alpha_prev, log_n_prev = carry
+            state, h, c, log_alpha_prev, log_n_prev, q_prev = carry
         else:
-            state, h, c = carry
+            state, h, c, q_prev = carry
 
         ice_flag = jnp.where(state.ice, 1.0, 0.0)
         strat_feat = compute_density_gradient_features(state.u, depth, phys_params["g"])
@@ -522,6 +626,13 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
             ]),
             strat_feat,
         ])
+        if feature_set == "extended" or depth_coord == "mixed_layer":
+            phys_feat, h_mix = lake_physics_features(
+                state.u, state.E_seiche, q_prev, forcing_t["Uw"] * phys_params["wind_factor"],
+                area, volume, depth, dx, phys_params,
+            )
+        if feature_set == "extended":
+            dyn_feat = jnp.concatenate([dyn_feat, phys_feat])
         features = jnp.concatenate([forcing_t["_nn_static"], dyn_feat])
 
         (h, c), y = lstm.apply(nn_params["lstm"], (h, c), features)
@@ -534,7 +645,9 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
             # DEFAULT_MAX_* comment for why both guards are needed to rule
             # out the feedback loop through `kzn_prev` regardless of
             # `weight_kz`.
-            log_correction = jnp.clip(jnp.dot(coefs, depth_powers), -max_log_correction, max_log_correction)
+            basis = (mixed_layer_basis(depth, h_mix, depth_basis_degree)
+                     if depth_coord == "mixed_layer" else depth_powers)
+            log_correction = jnp.clip(jnp.dot(coefs, basis), -max_log_correction, max_log_correction)
             correction = jnp.exp(log_correction)
 
             def kz_override(kz_process, u, ice, dens_u, forcing_step, ri):
@@ -576,9 +689,9 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
                 dens_diff=dens_new[-1] - dens_new[0],
                 Q_net=diag["Q_net"],
             )
-            new_carry = (new_state, h, c, log_alpha, log_n)
+            new_carry = (new_state, h, c, log_alpha, log_n, diag["Q_net"])
         else:
-            new_carry = (new_state, h, c)
+            new_carry = (new_state, h, c, diag["Q_net"])
         return new_carry, outputs
 
     @jax.checkpoint
@@ -587,7 +700,7 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
         carry = jax.tree_util.tree_map(lax.stop_gradient, carry)
         return carry, per_step_c
 
-    init_carry = (state0, h0, c0, log_alpha0, log_n0) if target == "ri" else (state0, h0, c0)
+    init_carry = (state0, h0, c0, log_alpha0, log_n0, q0) if target == "ri" else (state0, h0, c0, q0)
     _, per_step_chunked = lax.scan(chunk_body, init_carry, forcing_chunked)
     return {
         k: v.reshape((n_padded,) + v.shape[2:])[:n_steps]
@@ -624,7 +737,7 @@ def make_loss_fn(phys_params, geometry, forcing, ice_state, init_state, obs_trai
                   max_log_n=DEFAULT_MAX_LOG_N,
                   ri_alpha_init=DEFAULT_RI_ALPHA_INIT, ri_n_init=DEFAULT_RI_N_INIT,
                   ri_memory_hours=DEFAULT_RI_MEMORY_HOURS,
-                  obs_test=None):
+                  obs_test=None, depth_coord="absolute", feature_set="basic"):
     """Returns a `loss_fn(nn_params) -> (data_loss, test_rmse)` -- the second
     element is an aux value (see `jax.value_and_grad(..., has_aux=True)`),
     not part of the gradient, added so the training loop can watch
@@ -642,6 +755,7 @@ def make_loss_fn(phys_params, geometry, forcing, ice_state, init_state, obs_trai
             max_log_correction=max_log_correction, max_kz=max_kz, min_kz=min_kz,
             max_log_k0=max_log_k0, max_log_alpha=max_log_alpha, max_log_n=max_log_n,
             ri_alpha_init=ri_alpha_init, ri_n_init=ri_n_init, ri_memory_hours=ri_memory_hours,
+            depth_coord=depth_coord, feature_set=feature_set,
         )
         sim = per_step["u"][obs_train["step_idx"]]
         err2 = (sim - obs_train["values"]) ** 2 * obs_train["mask"]
@@ -799,6 +913,15 @@ def main():
                               "fields (default mcl_result.npz)")
     parser.add_argument("--nn-params-out", type=str, default="mcl_nn_params.pkl",
                          help="pickle path (relative to data_dir) to save the trained NN weights")
+    parser.add_argument("--depth-coord", choices=DEPTH_COORDS, default=DEFAULT_DEPTH_COORD,
+                         help="--target kz only: coordinate of the polynomial log-correction. "
+                              "'mixed_layer' (default): depth relative to the current mixed-layer "
+                              "depth, so a coefficient keeps meaning 'just below the mixed layer' as "
+                              "the thermocline moves; 'absolute': depth / max depth (the original form)")
+    parser.add_argument("--feature-set", choices=FEATURE_SETS, default=DEFAULT_FEATURE_SET,
+                         help="network inputs. 'extended' (default) adds mixed-layer depth, Schmidt "
+                              "stability, Lake Number, surface buoyancy flux and seiche energy to the "
+                              "16 'basic' inputs")
     args = parser.parse_args()
 
     os.chdir(args.data_dir)
@@ -925,7 +1048,8 @@ def main():
         bias_init = _constant_bias_init([
             np.log(args.ri_k0_init), np.log(args.ri_alpha_init), np.log(args.ri_n_init),
         ])
-    nn_params = init_nn_params(key, args.hidden_size, output_size, bias_init=bias_init)
+    nn_params = init_nn_params(key, args.hidden_size, output_size, bias_init=bias_init,
+                               n_feat=n_features(args.feature_set))
 
     loss_fn = make_loss_fn(
         phys_params, geometry, forcing, ice_state, init_state, obs_train,
@@ -935,7 +1059,7 @@ def main():
         max_log_correction=args.max_log_correction, max_kz=args.max_kz, min_kz=args.min_kz,
         max_log_k0=args.max_log_k0, max_log_alpha=args.max_log_alpha, max_log_n=args.max_log_n,
         ri_alpha_init=args.ri_alpha_init, ri_n_init=args.ri_n_init, ri_memory_hours=args.ri_memory_hours,
-        obs_test=obs_test,
+        obs_test=obs_test, depth_coord=args.depth_coord, feature_set=args.feature_set,
     )
     grad_fn = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
 
@@ -1088,6 +1212,7 @@ def main():
         max_log_correction=args.max_log_correction, max_kz=args.max_kz, min_kz=args.min_kz,
         max_log_k0=args.max_log_k0, max_log_alpha=args.max_log_alpha, max_log_n=args.max_log_n,
         ri_alpha_init=args.ri_alpha_init, ri_n_init=args.ri_n_init, ri_memory_hours=args.ri_memory_hours,
+        depth_coord=args.depth_coord, feature_set=args.feature_set,
     ))
     hybrid = hybrid_fn(nn_params)
     jax.block_until_ready(hybrid)
@@ -1154,6 +1279,7 @@ def main():
             hidden_size=args.hidden_size, depth_basis_degree=args.depth_basis_degree,
             kz_reg=args.kz_reg, feature_stats=feature_stats,
             forcing_feature_keys=FORCING_FEATURE_KEYS,
+            depth_coord=args.depth_coord, feature_set=args.feature_set,
             max_log_correction=args.max_log_correction, max_kz=args.max_kz, min_kz=args.min_kz,
             ri_k0_init=args.ri_k0_init, ri_alpha_init=args.ri_alpha_init, ri_n_init=args.ri_n_init,
             max_log_k0=args.max_log_k0, max_log_alpha=args.max_log_alpha, max_log_n=args.max_log_n,

@@ -133,6 +133,10 @@ def main():
     # pickles' *training* run would have applied had it existed yet, so
     # inference stays consistent with training even for older pickles.
     min_kz = trained.get("min_kz", DEFAULT_MIN_KZ)
+    # Pickles saved before --depth-coord/--feature-set existed were trained
+    # with the original absolute-depth basis and the 16 basic inputs.
+    depth_coord = trained.get("depth_coord", "absolute")
+    feature_set = trained.get("feature_set", "basic")
     ri_alpha_init = trained.get("ri_alpha_init")
     ri_n_init = trained.get("ri_n_init")
     ri_memory_hours = trained.get("ri_memory_hours")
@@ -240,6 +244,7 @@ def main():
         max_log_correction=max_log_correction, max_kz=max_kz, min_kz=min_kz,
         max_log_k0=max_log_k0, max_log_alpha=max_log_alpha, max_log_n=max_log_n,
         ri_alpha_init=ri_alpha_init, ri_n_init=ri_n_init, ri_memory_hours=ri_memory_hours,
+        depth_coord=depth_coord, feature_set=feature_set,
     ))
     hybrid = hybrid_fn(nn_params)
     jax.block_until_ready(hybrid)
@@ -262,6 +267,7 @@ def main():
         mcl_nn_params_path=np.array(nn_params_path),
         mcl_target=np.array(target),
         mcl_hidden_size=hidden_size,
+        mcl_depth_coord=np.array(depth_coord), mcl_feature_set=np.array(feature_set),
         mcl_chunk_steps=chunk_steps,
     )
     if target == "kz":
