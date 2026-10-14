@@ -147,8 +147,12 @@ def run_with_progress(step_fn, state0, forcing_series, geometry, params, output_
     @jax.jit
     def run_chunk(state, forcing_chunk):
         def body(s, forcing_t):
-            new_s = step_fn(s, forcing_t, geometry, params)
-            outputs = {name: new_s[name] for name in output_fields}
+            # step_fn returns either the new state, or (new_state, diag) where
+            # `diag` holds per-step diagnostics that aren't model state (e.g.
+            # kd_light); output_fields may name fields from either.
+            res = step_fn(s, forcing_t, geometry, params)
+            new_s, diag = res if isinstance(res, tuple) else (res, {})
+            outputs = {name: (diag[name] if name in diag else new_s[name]) for name in output_fields}
             return new_s, outputs
 
         return lax.scan(body, state, forcing_chunk)
@@ -305,13 +309,15 @@ def main():
     # step_fn contract (shared with temperature_step(), which returns just
     # new_state) only wants the state.
     def full_step_fn(state, forcing_t, geometry, params):
-        new_state, _ = full_step(state, forcing_t, geometry, params)
-        return new_state
+        new_state, diag = full_step(state, forcing_t, geometry, params)
+        # kd_light: the model's light extinction coefficient [1/m] this step,
+        # saved so plot_output.py can compare it against measured kd.
+        return new_state, {"kd_light": diag["kd_light"]}
 
     t0 = time.time()
     final_state, per_step = run_with_progress(
         full_step_fn, state0, forcing, geometry, params,
-        ["u", "o2", "docr", "docl", "pocr", "pocl", "uvel", "vvel", "E_seiche"], args.chunk_steps,
+        ["u", "o2", "docr", "docl", "pocr", "pocl", "uvel", "vvel", "E_seiche", "kd_light"], args.chunk_steps,
         desc="Lake model",
     )
     t1 = time.time()
@@ -323,6 +329,7 @@ def main():
         temp=per_step["u"], o2=per_step["o2"], docr=per_step["docr"],
         docl=per_step["docl"], pocr=per_step["pocr"], pocl=per_step["pocl"],
         uvel=per_step["uvel"], vvel=per_step["vvel"], E_seiche=per_step["E_seiche"],
+        kd_light=per_step["kd_light"],
         times=step_times, depth=np.asarray(depth), volume=np.asarray(volume),
     )
     print(f"Saved results to {out_path}")

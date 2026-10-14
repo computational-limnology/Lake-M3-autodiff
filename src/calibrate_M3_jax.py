@@ -11,7 +11,7 @@ oxygen "do" and dissolved organic carbon "doc", both in mg/L), using
 
 Usage:
     python src/calibrate_M3_jax.py Ravn [--steps N] [--chunk-steps N] [--iters K]
-        [--lr LR] [--topk K] [--params p1,p2,...] [--variables temp,o2,doc,poc] [--sensitivity-only]
+        [--lr LR] [--topk K] [--params p1,p2,...] [--variables temp,o2,doc,poc,kd] [--sensitivity-only]
 
     `--params p1,p2,...` skips the sensitivity screen entirely (both the
     combined and per-variable rankings) and calibrates exactly the named
@@ -315,6 +315,14 @@ CANDIDATE_PARAMS = [
 ]
 
 
+# Observation variables the calibration knows about, in canonical order.
+# "kd" is the light extinction coefficient [1/m] (e.g. derived from Secchi
+# depth), stored in the water-quality file as variable "kd" with one value
+# per date; it is compared against the model's own kd_light (computed each
+# step from light_water + light_doc*DOC + light_poc*POC in full_step).
+OBS_VARIABLES = ("temp", "o2", "doc", "poc", "kd")
+
+
 def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_config=None):
     """Load temperature/O2/DOC observations, restrict to the simulation
     window, and build per-variable dicts of (step_idx, values, mask)
@@ -384,6 +392,26 @@ def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_c
             mask=jnp.asarray(np.stack(mask_list)),
         )
 
+    def build_scalar(df, value_col):
+        """Like `build`, for a variable with one value per date and no depth
+        (e.g. kd): same-date values are averaged; `values`/`mask` are 1-D."""
+        df = df[(df["datetime"] >= start_date) & (df["datetime"] <= sim_end)]
+        df = df.dropna(subset=[value_col])
+        idxs, vals = [], []
+        for dtval, group in df.groupby("datetime"):
+            step_idx = int(round((dtval - start_date).total_seconds() / dt))
+            if step_idx < 0 or step_idx >= n_steps:
+                continue
+            idxs.append(step_idx)
+            vals.append(float(group[value_col].astype(float).mean()))
+        if not idxs:
+            return None
+        return dict(
+            step_idx=jnp.asarray(np.asarray(idxs)),
+            values=jnp.asarray(np.asarray(vals)),
+            mask=jnp.asarray(np.ones(len(idxs), dtype=bool)),
+        )
+
     hd = load_temperature_dataframe(data_dir, run_config)
     temp_obs = build(hd, "Depth_meter", "Water_Temperature_celsius", mass_convert=False) if hd is not None else None
 
@@ -399,10 +427,12 @@ def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_c
         # are missing. Compared against pocr+pocl combined (see extract_pairs/
         # make_loss_fn), mirroring how doc is compared against docr+docl.
         poc_obs = build(wq[wq["variable"] == "poc"], "depth", "observation", mass_convert=True)
+        # Light extinction kd [1/m], optional like poc: one value per date.
+        kd_obs = build_scalar(wq[wq["variable"] == "kd"], "observation")
     else:
-        o2_obs = doc_obs = poc_obs = None
+        o2_obs = doc_obs = poc_obs = kd_obs = None
 
-    return dict(temp=temp_obs, o2=o2_obs, doc=doc_obs, poc=poc_obs)
+    return dict(temp=temp_obs, o2=o2_obs, doc=doc_obs, poc=poc_obs, kd=kd_obs)
 
 
 def obs_weight(obs):
@@ -473,6 +503,10 @@ def extract_pairs(per_step, obs):
         sim = np.asarray(per_step["pocr"][obs["poc"]["step_idx"]] + per_step["pocl"][obs["poc"]["step_idx"]])
         mask = np.asarray(obs["poc"]["mask"])
         pairs["poc"] = (sim[mask], np.asarray(obs["poc"]["values"])[mask])
+    if obs.get("kd") is not None:
+        sim = np.asarray(per_step["kd_light"][obs["kd"]["step_idx"]])
+        mask = np.asarray(obs["kd"]["mask"])
+        pairs["kd"] = (sim[mask], np.asarray(obs["kd"]["values"])[mask])
     return pairs
 
 
@@ -588,9 +622,10 @@ def simulate_truncated(params, geometry, forcing, ice_state, init_state, chunk_s
     # memory that no longer scales with chunk length.
     @jax.checkpoint
     def step_body(s, forcing_t):
-        new_s, _ = full_step(s, forcing_t, geometry, params)
+        new_s, diag = full_step(s, forcing_t, geometry, params)
         outputs = dict(
             u=new_s.u, o2=new_s.o2, docr=new_s.docr, docl=new_s.docl, pocr=new_s.pocr, pocl=new_s.pocl,
+            kd_light=diag["kd_light"],
         )
         return new_s, outputs
 
@@ -638,6 +673,10 @@ def make_loss_fn(base_params, geometry, forcing, ice_state, init_state, obs, wei
             sim = per_step["pocr"][obs["poc"]["step_idx"]] + per_step["pocl"][obs["poc"]["step_idx"]]
             err2 = (sim - obs["poc"]["values"]) ** 2 * obs["poc"]["mask"]
             total = total + weights["poc"] * jnp.sum(err2) / jnp.maximum(jnp.sum(obs["poc"]["mask"]), 1.0)
+        if obs.get("kd") is not None:
+            sim = per_step["kd_light"][obs["kd"]["step_idx"]]
+            err2 = (sim - obs["kd"]["values"]) ** 2 * obs["kd"]["mask"]
+            total = total + weights["kd"] * jnp.sum(err2) / jnp.maximum(jnp.sum(obs["kd"]["mask"]), 1.0)
         return total
 
     return loss_fn
@@ -671,6 +710,10 @@ def make_per_variable_loss_fn(base_params, geometry, forcing, ice_state, init_st
                 sim = per_step["pocr"][obs["poc"]["step_idx"]] + per_step["pocl"][obs["poc"]["step_idx"]]
                 err2 = (sim - obs["poc"]["values"]) ** 2 * obs["poc"]["mask"]
                 losses.append(jnp.sum(err2) / jnp.maximum(jnp.sum(obs["poc"]["mask"]), 1.0))
+            elif name == "kd":
+                sim = per_step["kd_light"][obs["kd"]["step_idx"]]
+                err2 = (sim - obs["kd"]["values"]) ** 2 * obs["kd"]["mask"]
+                losses.append(jnp.sum(err2) / jnp.maximum(jnp.sum(obs["kd"]["mask"]), 1.0))
         return jnp.stack(losses)
 
     return fn
@@ -724,9 +767,10 @@ def main():
                          help="comma-separated parameter names to calibrate directly, "
                               "bypassing the sensitivity screen")
     parser.add_argument("--variables", type=str, default=None,
-                         help="comma-separated subset of temp,o2,doc,poc to calibrate against "
-                              "(default: all of temp/o2/doc/poc that have observations in the "
-                              "window -- poc only if the configured wq_ini_file has 'poc' rows). "
+                         help="comma-separated subset of temp,o2,doc,poc,kd to calibrate against "
+                              "(default: all of temp/o2/doc/poc/kd that have observations in the "
+                              "window -- poc/kd only if the configured wq_ini_file has 'poc'/'kd' "
+                              "rows; kd is compared against the model's kd_light). "
                               "Excluded variables are dropped from the loss and "
                               "sensitivity screens entirely, but still reported in the final "
                               "evaluation metrics for reference.")
@@ -802,18 +846,18 @@ def main():
           f"({n_steps * dt / 86400:.0f}-day) simulation window "
           f"({n_chunks} chunk(s) of up to {args.chunk_steps} steps for gradient truncation)...")
     obs = load_observations("./", depth, volume, desired_start, step_times, dt, run_config=run_config)
-    for name in ("temp", "o2", "doc", "poc"):
+    for name in OBS_VARIABLES:
         n = int(obs[name]["step_idx"].shape[0]) if obs[name] is not None else 0
         print(f"  {name}: {n} profile date(s) in window")
-    weights = {name: obs_weight(obs[name]) for name in ("temp", "o2", "doc", "poc")}
+    weights = {name: obs_weight(obs[name]) for name in OBS_VARIABLES}
 
-    present_vars = [name for name in ("temp", "o2", "doc", "poc") if obs[name] is not None]
+    present_vars = [name for name in OBS_VARIABLES if obs[name] is not None]
 
     if args.variables:
         requested = [v.strip() for v in args.variables.split(",") if v.strip()]
-        unknown = [v for v in requested if v not in ("temp", "o2", "doc", "poc")]
+        unknown = [v for v in requested if v not in OBS_VARIABLES]
         if unknown:
-            raise SystemExit(f"--variables entries must be from temp,o2,doc,poc: unknown {unknown}")
+            raise SystemExit(f"--variables entries must be from {','.join(OBS_VARIABLES)}: unknown {unknown}")
         missing = [v for v in requested if v not in present_vars]
         if missing:
             raise SystemExit(
@@ -822,7 +866,7 @@ def main():
                 "for them. Try a different --steps window, or drop them from --variables."
             )
         # canonical temp/o2/doc/poc order regardless of how the user typed --variables
-        active_vars = [name for name in ("temp", "o2", "doc", "poc") if name in requested]
+        active_vars = [name for name in OBS_VARIABLES if name in requested]
     else:
         active_vars = present_vars
 
@@ -842,7 +886,7 @@ def main():
     # is still used for the final evaluation metrics, so an excluded
     # variable is still reported (for reference) even though it never
     # contributed a gradient.
-    obs_for_loss = {name: (obs[name] if name in active_vars else None) for name in ("temp", "o2", "doc", "poc")}
+    obs_for_loss = {name: (obs[name] if name in active_vars else None) for name in OBS_VARIABLES}
 
     loss_fn = make_loss_fn(base_params, geometry, forcing, ice_state, init_state, obs_for_loss, weights, args.chunk_steps)
 

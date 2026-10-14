@@ -348,8 +348,114 @@ DEFAULT_FEATURE_SET = "extended"
 # "mixed_layer" = depth relative to the current mixed-layer depth h (see
 # mixed_layer_basis), so the same coefficients keep meaning "just below the
 # mixed layer" as the thermocline moves through the season.
-DEPTH_COORDS = ("absolute", "mixed_layer")
+DEPTH_COORDS = ("absolute", "mixed_layer", "mixed_layer_rbf")
 DEFAULT_DEPTH_COORD = "mixed_layer"
+
+
+# --correction-form (--target kz only):
+#   "multiplicative" (default; every pickle saved before this option existed):
+#       kz = kz_process * exp(c1(z))
+#   "additive":
+#       kz = kz_process * exp(c1(z)) + K_ref * softplus(c2(z))
+# c1 and c2 are each a polynomial in the chosen depth basis (--depth-coord,
+# so with "mixed_layer" both vary relative to the surface mixed-layer depth).
+# The additive term lets the network create mixing where kz_process sits at
+# its molecular floor (e.g. the summer metalimnion under richardson_seiche),
+# which a multiplicative factor alone cannot do without inflating kz
+# everywhere else. c2's constant term starts at ADDITIVE_INIT_OFFSET so the
+# added mixing starts near zero (softplus(-5) ~ 0.0067), i.e. the network
+# starts as an approximate no-op, like the multiplicative form.
+CORRECTION_FORMS = ("multiplicative", "additive")
+DEFAULT_CORRECTION_FORM = "multiplicative"
+DEFAULT_K_REF = 1e-5          # m2/s -- scale of the additive mixing term
+DEFAULT_MAX_ADD_FACTOR = 20.0  # additive term capped at K_ref * this (2e-4 m2/s by default)
+ADDITIVE_INIT_OFFSET = -5.0
+# c2 = ADDITIVE_OUTPUT_SCALE * (network output . basis). The head is trained
+# with Adam steps of ~lr per weight, so without scaling c2 would need
+# hundreds of iterations to climb from -5 to the range where softplus adds
+# meaningful mixing; scaling by 5 makes one unit of network output worth
+# five units of c2 (the head's c2 bias therefore starts at -5/5 = -1).
+ADDITIVE_OUTPUT_SCALE = 5.0
+
+
+# --depth-coord mixed_layer_rbf: normalised depth bands positioned relative
+# to the smooth mixed-layer depth h (see rbf_mixed_layer_basis). Positions
+# and widths are fractions of the water column below the mixed layer,
+# S = z_max - h (floored at RBF_MIN_SPAN_FRAC * z_max), so the bands scale
+# with lake depth and stretch/compress as the mixed layer deepens. Reference
+# metres below are for a 5 m mixed layer in Ravn (z_max 31.75 m, S = 26.75 m).
+#
+# Two band sets (--rbf-bands; saved in the trained pickle so a model always
+# runs with the set it was trained with):
+#
+#   "rbf7" (the first version): mixed layer + Gaussians 0, 3, 6, 10, 15 m
+#   below h (widths 2, 2, 2.5, 3, 4 m) + deep tail from 18 m. On Ravn the
+#   trained network put its strongest added mixing in the two hypolimnion
+#   bands, and because the 15 m band is 4 m wide, about a third of it
+#   reached 16 m depth (11 m below h) and warmed it.
+#
+#   "rbf9" (default): mixed layer + Gaussians 0, 2.5, 5, 7.5, 10, 13, 16 m
+#   below h (widths 1.5, 1.5, 1.5, 1.75, 1.75, 2, 2 m) + deep tail from 19 m
+#   (1.5 m transition). Narrower, more closely spaced bands through the
+#   metalimnion and upper hypolimnion: neighbouring centres are ~1.5-1.7
+#   widths apart, so a band's value reaches its neighbour's centre at only
+#   ~20-25% weight and the band two steps away at <1%. At 16 m depth (11 m
+#   below h) the hypolimnion bands (16 m below h and the tail) now contribute
+#   ~3% instead of ~35%.
+RBF_BAND_SETS = {
+    "rbf7": dict(
+        centers=(0.0, 0.11, 0.22, 0.37, 0.56),
+        widths=(0.075, 0.075, 0.093, 0.11, 0.15),
+        ml_transition=0.037, tail_center=0.67, tail_width=0.11,
+        labels=("mixed layer", "ML base", "upper metalimnion", "mid metalimnion",
+                "lower metalimnion", "upper hypolimnion", "deep hypolimnion"),
+    ),
+    "rbf9": dict(
+        centers=tuple(round(m / 26.75, 4) for m in (0.0, 2.5, 5.0, 7.5, 10.0, 13.0, 16.0)),
+        widths=tuple(round(m / 26.75, 4) for m in (1.5, 1.5, 1.5, 1.75, 1.75, 2.0, 2.0)),
+        ml_transition=round(1.0 / 26.75, 4), tail_center=round(19.0 / 26.75, 4),
+        tail_width=round(1.5 / 26.75, 4),
+        labels=("mixed layer", "ML base", "ML+9%", "ML+19%", "ML+28%", "ML+37%",
+                "ML+49%", "ML+60%", "deep tail (ML+71%)"),
+    ),
+}
+DEFAULT_RBF_BANDS = "rbf9"
+RBF_MIN_SPAN_FRAC = 0.2
+
+
+def n_basis(depth_coord, depth_basis_degree, rbf_bands=DEFAULT_RBF_BANDS):
+    if depth_coord == "mixed_layer_rbf":
+        return len(RBF_BAND_SETS[rbf_bands]["labels"])
+    return depth_basis_degree + 1
+
+
+def kz_output_size(depth_basis_degree, correction_form, depth_coord="absolute", rbf_bands=DEFAULT_RBF_BANDS):
+    return n_basis(depth_coord, depth_basis_degree, rbf_bands) * (2 if correction_form == "additive" else 1)
+
+
+def rbf_mixed_layer_basis(depth, h, rbf_bands=DEFAULT_RBF_BANDS):
+    """`(n_bands, nx)` normalised depth bands relative to the mixed-layer
+    depth h, for band set `rbf_bands` (see RBF_BAND_SETS).
+
+    With s = z - h (negative in the mixed layer) and S = max(z_max - h,
+    RBF_MIN_SPAN_FRAC * z_max):
+      first band: mixed layer, sigmoid(-s / (f_ML * S))
+      middle bands: Gaussians exp(-0.5 ((s - c_k S) / (w_k S))^2)
+      last band: deep tail, sigmoid((s - c_tail S) / (w_tail S))
+    Each depth's band weights are divided by their sum, so the bands form a
+    partition of unity: a coefficient means "the correction near band k",
+    the profile blends smoothly between bands, and equal coefficients give a
+    depth-uniform correction."""
+    cfg = RBF_BAND_SETS[rbf_bands]
+    z_max = jnp.max(depth)
+    S = jnp.maximum(z_max - h, RBF_MIN_SPAN_FRAC * z_max)
+    s = depth - h
+    bands = [jax.nn.sigmoid(-s / (cfg["ml_transition"] * S))]
+    for c, w in zip(cfg["centers"], cfg["widths"]):
+        bands.append(jnp.exp(-0.5 * ((s - c * S) / (w * S)) ** 2))
+    bands.append(jax.nn.sigmoid((s - cfg["tail_center"] * S) / (cfg["tail_width"] * S)))
+    phi = jnp.stack(bands, axis=0)
+    return phi / (jnp.sum(phi, axis=0, keepdims=True) + 1e-12)
 
 
 def n_features(feature_set):
@@ -540,6 +646,7 @@ def simulate_baseline(phys_params, geometry, forcing, ice_state, init_state):
             o2=new_state.o2, docr=new_state.docr, docl=new_state.docl,
             pocr=new_state.pocr, pocl=new_state.pocl,
             uvel=new_state.uvel, vvel=new_state.vvel, E_seiche=new_state.E_seiche,
+            kd_light=diag["kd_light"],
         )
         return new_state, outputs
 
@@ -562,8 +669,10 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
                      max_log_n=DEFAULT_MAX_LOG_N,
                      ri_alpha_init=DEFAULT_RI_ALPHA_INIT, ri_n_init=DEFAULT_RI_N_INIT,
                      ri_memory_hours=DEFAULT_RI_MEMORY_HOURS,
-                     depth_coord="absolute", feature_set="basic"):
-    output_size = (depth_basis_degree + 1) if target == "kz" else 3
+                     depth_coord="absolute", feature_set="basic",
+                     correction_form="multiplicative", k_ref=DEFAULT_K_REF,
+                     max_add_factor=DEFAULT_MAX_ADD_FACTOR, rbf_bands=DEFAULT_RBF_BANDS):
+    output_size = kz_output_size(depth_basis_degree, correction_form, depth_coord, rbf_bands) if target == "kz" else 3
     lstm, head = make_modules(hidden_size, output_size)
 
     u0, o2_0, docr_0, docl_0, pocr_0, pocl_0 = init_state
@@ -626,7 +735,7 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
             ]),
             strat_feat,
         ])
-        if feature_set == "extended" or depth_coord == "mixed_layer":
+        if feature_set == "extended" or depth_coord in ("mixed_layer", "mixed_layer_rbf"):
             phys_feat, h_mix = lake_physics_features(
                 state.u, state.E_seiche, q_prev, forcing_t["Uw"] * phys_params["wind_factor"],
                 area, volume, depth, dx, phys_params,
@@ -645,13 +754,25 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
             # DEFAULT_MAX_* comment for why both guards are needed to rule
             # out the feedback loop through `kzn_prev` regardless of
             # `weight_kz`.
-            basis = (mixed_layer_basis(depth, h_mix, depth_basis_degree)
-                     if depth_coord == "mixed_layer" else depth_powers)
-            log_correction = jnp.clip(jnp.dot(coefs, basis), -max_log_correction, max_log_correction)
+            if depth_coord == "mixed_layer_rbf":
+                basis = rbf_mixed_layer_basis(depth, h_mix, rbf_bands)
+            elif depth_coord == "mixed_layer":
+                basis = mixed_layer_basis(depth, h_mix, depth_basis_degree)
+            else:
+                basis = depth_powers
+            nb = n_basis(depth_coord, depth_basis_degree, rbf_bands)
+            log_correction = jnp.clip(jnp.dot(coefs[:nb], basis), -max_log_correction, max_log_correction)
             correction = jnp.exp(log_correction)
+            if correction_form == "additive":
+                # Clip before softplus only to keep it finite; the cap on the
+                # added mixing itself is the min() below.
+                c2 = jnp.clip(ADDITIVE_OUTPUT_SCALE * jnp.dot(coefs[nb:], basis), -30.0, 30.0)
+                kz_add = k_ref * jnp.minimum(jax.nn.softplus(c2), max_add_factor)
+            else:
+                kz_add = jnp.zeros_like(correction)
 
             def kz_override(kz_process, u, ice, dens_u, forcing_step, ri):
-                return jnp.clip(kz_process * correction, min_kz, max_kz)
+                return jnp.clip(kz_process * correction + kz_add, min_kz, max_kz)
         else:  # target == "ri"
             # `Ri >= 0` always and `alpha, n >= 0` here by construction, so
             # `(1 + alpha*Ri)**(-n)` is always in (0, 1] -- clipping `K0`
@@ -680,7 +801,14 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
             pocr=new_state.pocr, pocl=new_state.pocl,
             kz=new_state.kz, kz_process=diag["kz_process"],
             uvel=new_state.uvel, vvel=new_state.vvel, E_seiche=new_state.E_seiche,
+            kd_light=diag["kd_light"],
         )
+        if target == "kz":
+            # Per-step correction coefficients (a: log-scaling, b: added-mixing
+            # pre-softplus, both per basis function) for plot_mcl_kz.py.
+            outputs = dict(outputs, coef_a=coefs[:nb])
+            if correction_form == "additive":
+                outputs = dict(outputs, kz_add=kz_add, coef_b=coefs[nb:])
         if target == "ri":
             dens_new = calc_dens(new_state.u)
             outputs = dict(
@@ -737,7 +865,9 @@ def make_loss_fn(phys_params, geometry, forcing, ice_state, init_state, obs_trai
                   max_log_n=DEFAULT_MAX_LOG_N,
                   ri_alpha_init=DEFAULT_RI_ALPHA_INIT, ri_n_init=DEFAULT_RI_N_INIT,
                   ri_memory_hours=DEFAULT_RI_MEMORY_HOURS,
-                  obs_test=None, depth_coord="absolute", feature_set="basic"):
+                  obs_test=None, depth_coord="absolute", feature_set="basic",
+                  correction_form="multiplicative", k_ref=DEFAULT_K_REF,
+                  max_add_factor=DEFAULT_MAX_ADD_FACTOR, rbf_bands=DEFAULT_RBF_BANDS):
     """Returns a `loss_fn(nn_params) -> (data_loss, test_rmse)` -- the second
     element is an aux value (see `jax.value_and_grad(..., has_aux=True)`),
     not part of the gradient, added so the training loop can watch
@@ -756,6 +886,8 @@ def make_loss_fn(phys_params, geometry, forcing, ice_state, init_state, obs_trai
             max_log_k0=max_log_k0, max_log_alpha=max_log_alpha, max_log_n=max_log_n,
             ri_alpha_init=ri_alpha_init, ri_n_init=ri_n_init, ri_memory_hours=ri_memory_hours,
             depth_coord=depth_coord, feature_set=feature_set,
+            correction_form=correction_form, k_ref=k_ref, max_add_factor=max_add_factor,
+            rbf_bands=rbf_bands,
         )
         sim = per_step["u"][obs_train["step_idx"]]
         err2 = (sim - obs_train["values"]) ** 2 * obs_train["mask"]
@@ -917,11 +1049,30 @@ def main():
                          help="--target kz only: coordinate of the polynomial log-correction. "
                               "'mixed_layer' (default): depth relative to the current mixed-layer "
                               "depth, so a coefficient keeps meaning 'just below the mixed layer' as "
-                              "the thermocline moves; 'absolute': depth / max depth (the original form)")
+                              "the thermocline moves; 'absolute': depth / max depth (the original form); "
+                              "'mixed_layer_rbf': seven normalised depth bands placed relative to the "
+                              "mixed-layer depth and scaled to the water column below it (mixed layer, "
+                              "ML base, upper/mid/lower metalimnion, upper/deep hypolimnion) -- "
+                              "--depth-basis-degree is ignored")
+    parser.add_argument("--rbf-bands", choices=tuple(RBF_BAND_SETS), default=DEFAULT_RBF_BANDS,
+                         help=f"--depth-coord mixed_layer_rbf only: band set (default {DEFAULT_RBF_BANDS}). "
+                              "'rbf9': 9 narrower bands through the metalimnion/upper hypolimnion; "
+                              "'rbf7': the original 7 wider bands (see RBF_BAND_SETS)")
     parser.add_argument("--feature-set", choices=FEATURE_SETS, default=DEFAULT_FEATURE_SET,
                          help="network inputs. 'extended' (default) adds mixed-layer depth, Schmidt "
                               "stability, Lake Number, surface buoyancy flux and seiche energy to the "
                               "16 'basic' inputs")
+    parser.add_argument("--correction-form", choices=CORRECTION_FORMS, default=DEFAULT_CORRECTION_FORM,
+                         help="--target kz only. 'multiplicative' (default): kz = kz_process*exp(c1(z)). "
+                              "'additive': kz = kz_process*exp(c1(z)) + K_ref*softplus(c2(z)), so the "
+                              "network can add mixing where kz_process is near its molecular floor; "
+                              "c1 and c2 both use the --depth-coord basis")
+    parser.add_argument("--k-ref", type=float, default=DEFAULT_K_REF,
+                         help=f"--correction-form additive: scale K_ref of the added mixing [m2/s] "
+                              f"(default {DEFAULT_K_REF:g})")
+    parser.add_argument("--max-add-factor", type=float, default=DEFAULT_MAX_ADD_FACTOR,
+                         help=f"--correction-form additive: cap on softplus(c2), i.e. added mixing <= "
+                              f"K_ref * this (default {DEFAULT_MAX_ADD_FACTOR:g})")
     args = parser.parse_args()
 
     os.chdir(args.data_dir)
@@ -1041,8 +1192,18 @@ def main():
     # --- train the NN correction ---
     key = jax.random.PRNGKey(args.seed)
     if args.target == "kz":
-        output_size = args.depth_basis_degree + 1
-        bias_init = None
+        output_size = kz_output_size(args.depth_basis_degree, args.correction_form, args.depth_coord, args.rbf_bands)
+        if args.correction_form == "additive":
+            # c1 starts at 0 (no scaling); c2 starts at ADDITIVE_INIT_OFFSET so
+            # the added mixing starts near zero. For the polynomial bases only
+            # the constant term carries the offset; the rbf bands sum to 1, so
+            # every band coefficient gets it.
+            nb = n_basis(args.depth_coord, args.depth_basis_degree, args.rbf_bands)
+            b0 = ADDITIVE_INIT_OFFSET / ADDITIVE_OUTPUT_SCALE
+            b_init = [b0] * nb if args.depth_coord == "mixed_layer_rbf" else [b0] + [0.0] * (nb - 1)
+            bias_init = _constant_bias_init([0.0] * nb + b_init)
+        else:
+            bias_init = None
     else:
         output_size = 3
         bias_init = _constant_bias_init([
@@ -1060,6 +1221,8 @@ def main():
         max_log_k0=args.max_log_k0, max_log_alpha=args.max_log_alpha, max_log_n=args.max_log_n,
         ri_alpha_init=args.ri_alpha_init, ri_n_init=args.ri_n_init, ri_memory_hours=args.ri_memory_hours,
         obs_test=obs_test, depth_coord=args.depth_coord, feature_set=args.feature_set,
+        correction_form=args.correction_form, k_ref=args.k_ref, max_add_factor=args.max_add_factor,
+        rbf_bands=args.rbf_bands,
     )
     grad_fn = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
 
@@ -1213,6 +1376,8 @@ def main():
         max_log_k0=args.max_log_k0, max_log_alpha=args.max_log_alpha, max_log_n=args.max_log_n,
         ri_alpha_init=args.ri_alpha_init, ri_n_init=args.ri_n_init, ri_memory_hours=args.ri_memory_hours,
         depth_coord=args.depth_coord, feature_set=args.feature_set,
+        correction_form=args.correction_form, k_ref=args.k_ref, max_add_factor=args.max_add_factor,
+        rbf_bands=args.rbf_bands,
     ))
     hybrid = hybrid_fn(nn_params)
     jax.block_until_ready(hybrid)
@@ -1247,6 +1412,7 @@ def main():
         uvel_baseline=np.asarray(baseline["uvel"]), uvel_hybrid=np.asarray(hybrid["uvel"]),
         vvel_baseline=np.asarray(baseline["vvel"]), vvel_hybrid=np.asarray(hybrid["vvel"]),
         E_seiche_baseline=np.asarray(baseline["E_seiche"]), E_seiche_hybrid=np.asarray(hybrid["E_seiche"]),
+        kd_light_baseline=np.asarray(baseline["kd_light"]), kd_light_hybrid=np.asarray(hybrid["kd_light"]),
         train_lo=train_lo, train_hi=train_hi, test_lo=test_lo, test_hi=test_hi,
         # raw meteorological wind speed (lake_config.csv's WindSpeed factor
         # already applied, same series the model itself is driven by, before
@@ -1268,6 +1434,20 @@ def main():
             Q_net_hybrid=np.asarray(hybrid["Q_net"]),
             ri_memory_hours=args.ri_memory_hours,
         )
+    if "kz_add" in hybrid:
+        save_kwargs["kz_add_hybrid"] = np.asarray(hybrid["kz_add"])
+    for key in ("coef_a", "coef_b"):
+        if key in hybrid:
+            save_kwargs[f"{key}_hybrid"] = np.asarray(hybrid[key])
+    if args.target == "kz":
+        save_kwargs["mcl_depth_coord"] = np.array(args.depth_coord)
+        save_kwargs["mcl_correction_form"] = np.array(args.correction_form)
+        save_kwargs["mcl_k_ref"] = args.k_ref
+        save_kwargs["mcl_max_add_factor"] = args.max_add_factor
+        save_kwargs["mcl_add_output_scale"] = ADDITIVE_OUTPUT_SCALE
+        if args.depth_coord == "mixed_layer_rbf":
+            save_kwargs["mcl_band_labels"] = np.array(RBF_BAND_SETS[args.rbf_bands]["labels"])
+            save_kwargs["mcl_rbf_bands"] = np.array(args.rbf_bands)
     np.savez(out_path, **save_kwargs)
     print(f"\nSaved kz/temperature fields to {out_path}")
 
@@ -1280,6 +1460,8 @@ def main():
             kz_reg=args.kz_reg, feature_stats=feature_stats,
             forcing_feature_keys=FORCING_FEATURE_KEYS,
             depth_coord=args.depth_coord, feature_set=args.feature_set,
+            correction_form=args.correction_form, k_ref=args.k_ref, max_add_factor=args.max_add_factor,
+            rbf_bands=args.rbf_bands,
             max_log_correction=args.max_log_correction, max_kz=args.max_kz, min_kz=args.min_kz,
             ri_k0_init=args.ri_k0_init, ri_alpha_init=args.ri_alpha_init, ri_n_init=args.ri_n_init,
             max_log_k0=args.max_log_k0, max_log_alpha=args.max_log_alpha, max_log_n=args.max_log_n,

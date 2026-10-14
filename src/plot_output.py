@@ -173,7 +173,7 @@ def _load_water_quality_observations(result_path, observations_path=None):
         variable: observations[observations["variable"] == variable].rename(
             columns={"depth": "Depth_meter", "observation": "value"}
         )
-        for variable in ("do", "doc", "poc")
+        for variable in ("do", "doc", "poc", "kd")
     }
 
 
@@ -380,6 +380,70 @@ def _compute_metrics(model_data, time_values, depth_values, observations, value_
         n=int(finite.sum()), rmse=_rmse(sim, obs), nse=_nse(sim, obs),
         kge=_kge(sim, obs), r2=_r2(sim, obs),
     )
+
+
+def _match_kd(kd_model, time_values, start_time, kd_obs):
+    """Pair each measured kd (one value per date, no depth) with the
+    modeled kd_light at the nearest model timestamp, within the modeled
+    period. Returns (obs_datetimes, observed, modeled) or None."""
+    if kd_obs is None or kd_obs.empty or kd_model is None:
+        return None
+    kd_obs, model_datetimes = _filter_to_modeled_period(kd_obs, time_values, start_time)
+    if kd_obs.empty or model_datetimes is None:
+        return None
+    kd_obs = kd_obs.groupby("datetime", as_index=False)["value"].mean()  # same-day duplicates
+    model_ns = pd.DatetimeIndex(model_datetimes).asi8
+    obs_ns = pd.DatetimeIndex(kd_obs["datetime"]).asi8
+    idx = np.clip(np.searchsorted(model_ns, obs_ns), 1, len(model_ns) - 1)
+    idx = np.where(np.abs(model_ns[idx - 1] - obs_ns) < np.abs(model_ns[idx] - obs_ns), idx - 1, idx)
+    return kd_obs["datetime"], kd_obs["value"].to_numpy(dtype=float), np.asarray(kd_model)[idx]
+
+
+def _kd_metrics(kd_model, time_values, start_time, kd_obs):
+    matched = _match_kd(kd_model, time_values, start_time, kd_obs)
+    if matched is None:
+        return None
+    _, obs, sim = matched
+    finite = np.isfinite(obs) & np.isfinite(sim)
+    if not finite.any():
+        return None
+    obs, sim = obs[finite], sim[finite]
+    return dict(n=int(finite.sum()), rmse=_rmse(sim, obs), nse=_nse(sim, obs),
+                kge=_kge(sim, obs), r2=_r2(sim, obs))
+
+
+def _plot_kd_series(kd_model, time_values, start_time, kd_obs):
+    """Time series of the model's light extinction kd_light [1/m] against
+    measured kd (e.g. derived from Secchi depth), with a modeled-vs-observed
+    scatter beside it."""
+    model_datetimes = _model_datetimes(time_values, start_time)
+    x = model_datetimes if model_datetimes is not None else np.arange(len(kd_model))
+    matched = _match_kd(kd_model, time_values, start_time, kd_obs)
+    fig, (ax_ts, ax_sc) = plt.subplots(1, 2, figsize=(16, 4.5), gridspec_kw={"width_ratios": [3, 1]})
+    ax_ts.plot(x, kd_model, color="tab:blue", lw=1.0, label="Model kd_light")
+    if matched is not None:
+        obs_dt, obs, sim = matched
+        ax_ts.scatter(obs_dt, obs, color="black", s=18, zorder=3, label="Measured kd")
+        ax_sc.scatter(obs, sim, color="black", s=18)
+        lo = float(np.nanmin(np.concatenate([obs, sim])))
+        hi = float(np.nanmax(np.concatenate([obs, sim])))
+        ax_sc.plot([lo, hi], [lo, hi], "k--", lw=1, label="1:1")
+        ax_sc.legend()
+    else:
+        ax_sc.text(0.5, 0.5, "no measured kd\nin modeled period", ha="center", va="center",
+                   transform=ax_sc.transAxes)
+    ax_ts.set_title("Light extinction coefficient: modeled vs measured")
+    ax_ts.set_ylabel("kd (1/m)")
+    ax_ts.set_xlabel("Date" if model_datetimes is not None else "Time step")
+    ax_ts.grid(alpha=0.3)
+    ax_ts.legend()
+    ax_sc.set_title("kd: modeled vs measured")
+    ax_sc.set_xlabel("Measured kd (1/m)")
+    ax_sc.set_ylabel("Modeled kd_light (1/m)")
+    ax_sc.grid(alpha=0.3)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    return fig
 
 
 def _print_metrics_table(metrics):
@@ -739,7 +803,18 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
                 pocr + pocl, time_values, depth_values, water_quality_observations.get("poc"),
                 "value", start_time,
             )
+    # Light extinction: modeled kd_light (saved by run_M3_jax.py and the MCL
+    # scripts) against measured kd rows of the water-quality file, if both exist.
+    kd_key = _resolve_series_key(res, "kd_light", series)
+    kd_model = to_numpy(res[kd_key]).reshape(-1) if kd_key is not None else None
+    kd_obs = water_quality_observations.get("kd")
+    if kd_model is not None and kd_model.size != n_time:
+        kd_model = None
+    if kd_model is not None and kd_obs is not None and not kd_obs.empty:
+        metrics["kd"] = _kd_metrics(kd_model, time_values, start_time, kd_obs)
     _print_metrics_table(metrics)
+    if kd_model is not None:
+        _plot_kd_series(kd_model, time_values, start_time, kd_obs)
 
     if volume is not None and volume.size == n_depth:
         o2 = arrays.get("o2")

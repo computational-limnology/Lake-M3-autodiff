@@ -137,6 +137,12 @@ def main():
     # with the original absolute-depth basis and the 16 basic inputs.
     depth_coord = trained.get("depth_coord", "absolute")
     feature_set = trained.get("feature_set", "basic")
+    correction_form = trained.get("correction_form", "multiplicative")
+    k_ref = trained.get("k_ref", 1e-5)
+    max_add_factor = trained.get("max_add_factor", 20.0)
+    # Models trained with mixed_layer_rbf before the band sets existed used
+    # the original 7 bands.
+    rbf_bands = trained.get("rbf_bands", "rbf7")
     ri_alpha_init = trained.get("ri_alpha_init")
     ri_n_init = trained.get("ri_n_init")
     ri_memory_hours = trained.get("ri_memory_hours")
@@ -245,6 +251,8 @@ def main():
         max_log_k0=max_log_k0, max_log_alpha=max_log_alpha, max_log_n=max_log_n,
         ri_alpha_init=ri_alpha_init, ri_n_init=ri_n_init, ri_memory_hours=ri_memory_hours,
         depth_coord=depth_coord, feature_set=feature_set,
+        correction_form=correction_form, k_ref=k_ref, max_add_factor=max_add_factor,
+        rbf_bands=rbf_bands,
     ))
     hybrid = hybrid_fn(nn_params)
     jax.block_until_ready(hybrid)
@@ -258,7 +266,7 @@ def main():
         docr=np.asarray(hybrid["docr"]), docl=np.asarray(hybrid["docl"]),
         pocr=np.asarray(hybrid["pocr"]), pocl=np.asarray(hybrid["pocl"]),
         uvel=np.asarray(hybrid["uvel"]), vvel=np.asarray(hybrid["vvel"]),
-        E_seiche=np.asarray(hybrid["E_seiche"]),
+        E_seiche=np.asarray(hybrid["E_seiche"]), kd_light=np.asarray(hybrid["kd_light"]),
         times=step_times, depth=np.asarray(depth), volume=np.asarray(volume),
         kz=np.asarray(hybrid["kz"]), kz_process=np.asarray(hybrid["kz_process"]),
         # --- provenance: makes this file's origin unambiguous even without
@@ -268,6 +276,7 @@ def main():
         mcl_target=np.array(target),
         mcl_hidden_size=hidden_size,
         mcl_depth_coord=np.array(depth_coord), mcl_feature_set=np.array(feature_set),
+        mcl_correction_form=np.array(correction_form), mcl_rbf_bands=np.array(rbf_bands),
         mcl_chunk_steps=chunk_steps,
     )
     if target == "kz":
@@ -284,6 +293,11 @@ def main():
             mcl_ri_alpha_init=ri_alpha_init, mcl_ri_n_init=ri_n_init,
             mcl_ri_memory_hours=ri_memory_hours, mcl_max_kz=max_kz, mcl_min_kz=min_kz,
         )
+    if "kz_add" in hybrid:
+        save_kwargs["kz_add"] = np.asarray(hybrid["kz_add"])
+    for key in ("coef_a", "coef_b"):
+        if key in hybrid:
+            save_kwargs[key] = np.asarray(hybrid[key])  # --correction-form additive: K_ref*softplus(c2)
     np.savez(out_path, **save_kwargs)
     print(f"\nSaved MCL hybrid-model output (model_source='mcl_hybrid_inference') to {out_path}")
 

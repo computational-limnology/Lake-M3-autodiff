@@ -21,7 +21,7 @@ Usage:
     python src/run_M3_calibrate_then_mcl.py Ravn --params Cd,at_factor
         [--cal-steps N] [--cal-chunk-steps N] [--cal-iters K] [--cal-lr LR]
         [--cal-early-stop-patience N] [--cal-early-stop-tol TOL]
-        [--cal-variables temp,o2,doc,poc]
+        [--cal-variables temp,o2,doc,poc,kd]
         [--mcl-target {kz,ri}]
         [--hidden-size H] [--depth-basis-degree D] [--kz-reg LAMBDA]
         [--ri-k0-init K0] [--ri-alpha-init A] [--ri-n-init N] [--ri-memory-hours H]
@@ -246,7 +246,7 @@ def main():
     cal.add_argument("--cal-select-mode", choices=["per-variable", "combined"], default="per-variable",
                       help="only used when --params is omitted")
     cal.add_argument("--cal-variables", type=str, default=None,
-                      help="comma-separated subset of temp,o2,doc,poc to calibrate against "
+                      help="comma-separated subset of temp,o2,doc,poc,kd to calibrate against "
                            "(default: all with observations in the window -- poc only if the "
                            "dataset's wq_ini_file has 'poc' rows)")
 

@@ -97,6 +97,78 @@ def shade_windows(ax, model_datetimes, train_lo, train_hi, test_lo, test_hi):
                    color="tab:blue", alpha=0.08, label="test window", zorder=0)
 
 
+def plot_coefficients(result, model_datetimes, train_lo, train_hi, test_lo, test_hi):
+    """Second figure: time series of the LSTM's per-step correction
+    coefficients (`--target kz` runs saved after coef_a/coef_b were added).
+
+    Top: a_k, the log-scaling coefficient of each basis function (kz_process
+    is multiplied by exp(sum_k a_k * phi_k(z)); 0 = no change).
+    Bottom (additive form only): the mixing each basis function adds on its
+    own, K_ref * min(softplus(scale * b_k), max_add_factor) [m^2/s], log axis.
+    For `--depth-coord mixed_layer_rbf` the basis functions are the named
+    depth bands; otherwise they are polynomial terms x^k. Daily means are
+    plotted for readability; train/test windows are shaded."""
+    if "coef_a_hybrid" not in result:
+        return None
+    a = np.asarray(result["coef_a_hybrid"])
+    b = np.asarray(result["coef_b_hybrid"]) if "coef_b_hybrid" in result else None
+    nb = a.shape[1]
+    if "mcl_band_labels" in result:
+        labels = [str(x) for x in np.asarray(result["mcl_band_labels"])]
+    else:
+        labels = [f"x^{k}" for k in range(nb)]
+    depth_coord = str(result["mcl_depth_coord"]) if "mcl_depth_coord" in result else "?"
+
+    n_rows = 2 if b is not None else 1
+    fig, axes = plt.subplots(n_rows, 1, figsize=(16, 4.2 * n_rows), sharex=True, squeeze=False)
+    axes = axes[:, 0]
+    colors = plt.colormaps.get_cmap("viridis")(np.linspace(0, 0.95, nb))
+
+    def daily(x):
+        if model_datetimes is None:
+            return np.arange(x.shape[0]), x
+        df = pd.DataFrame(x, index=model_datetimes).resample("D").mean()
+        return df.index, df.to_numpy()
+
+    t, a_d = daily(a)
+    ax = axes[0]
+    if model_datetimes is not None:
+        shade_windows(ax, model_datetimes, train_lo, train_hi, test_lo, test_hi)
+    for k in range(nb):
+        ax.plot(t, a_d[:, k], color=colors[k], lw=1.2, label=labels[k])
+    ax.axhline(0, color="k", lw=0.8, ls=":")
+    ax.set_ylabel("a_k (log-scaling of kz_process)")
+    note = ""
+    if "mcl_rbf_bands" in result:
+        note = f", bands: {str(result['mcl_rbf_bands'])}"
+    if any("ML+" in lab for lab in labels):
+        note += "; ML+x% = centred x% of the water column below the mixed layer"
+    ax.set_title(f"Multiplicative correction coefficients a_k  (depth coordinate: {depth_coord}{note})")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8, ncol=min(nb + 2, 5), loc="upper left")
+
+    if b is not None:
+        k_ref = float(result.get("mcl_k_ref", 1e-5))
+        cap = float(result.get("mcl_max_add_factor", 20.0))
+        scale = float(result.get("mcl_add_output_scale", 5.0))
+        added = k_ref * np.minimum(np.logaddexp(0.0, scale * b), cap)  # softplus
+        t, add_d = daily(added)
+        ax = axes[1]
+        if model_datetimes is not None:
+            shade_windows(ax, model_datetimes, train_lo, train_hi, test_lo, test_hi)
+        for k in range(nb):
+            ax.plot(t, add_d[:, k], color=colors[k], lw=1.2, label=labels[k])
+        ax.set_yscale("log")
+        ax.set_ylabel("K_ref*softplus(scale*b_k)  (m^2/s)")
+        ax.set_title("Additive correction per basis function b_k, as added mixing")
+        ax.grid(alpha=0.3, which="both")
+        ax.legend(fontsize=8, ncol=min(nb + 2, 5), loc="upper left")
+    axes[-1].set_xlabel("Date" if model_datetimes is not None else "Time step")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    return fig
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("result_path", help="Path to mcl_result.npz (from train_M3_mcl_jax.py).")
@@ -163,7 +235,7 @@ def main():
 
     ax_base = fig.add_subplot(top[0, 0])
     mesh = plot_kz_heatmap(ax_base, kz_baseline, model_datetimes, depth, norm, cmap,
-                            "kz: process-based (Henderson-Sellers)")
+                            "kz: process-based (Pacanowski-Seiches)")
     ax_hyb = fig.add_subplot(top[0, 1])
     plot_kz_heatmap(ax_hyb, kz_hybrid, model_datetimes, depth, norm, cmap,
                      "kz: process + LSTM correction")
@@ -205,18 +277,20 @@ def main():
         if model_datetimes is not None:
             shade_windows(ax, model_datetimes, train_lo, train_hi, test_lo, test_hi)
 
-        ax.plot(x, temp_baseline[:, model_idx], label="baseline (process-based kz)",
-                color="tab:gray", lw=1.2)
-        ax.plot(x, temp_hybrid[:, model_idx], label="hybrid (process + LSTM kz)",
-                color="tab:red", lw=1.0)
+
 
         if obs_windowed is not None and not obs_windowed.empty:
             obs_depths = np.sort(obs_windowed["Depth_meter"].unique())
             nearest_obs_depth = float(obs_depths[np.argmin(np.abs(obs_depths - target_depth))])
             obs_here = obs_windowed[obs_windowed["Depth_meter"] == nearest_obs_depth]
             ax.scatter(obs_here["datetime"], obs_here["Water_Temperature_celsius"],
-                       label=f"observed ({nearest_obs_depth:g} m)", color="black", s=10, zorder=3, alpha=0.6)
-
+                       label=f"observed ({nearest_obs_depth:g} m)", color="black", s=10, zorder=3, alpha=0.2)
+        
+        ax.plot(x, temp_baseline[:, model_idx], label="baseline (process-based kz)",
+                color="tab:gray", lw=1.2, zorder =8)
+        ax.plot(x, temp_hybrid[:, model_idx], label="hybrid (process + LSTM kz)",
+                color="tab:red", lw=1.0, zorder = 10)
+        
         ax.set_title(f"Temperature at {depth[model_idx]:g} m (nearest to {target_depth:g} m)")
         ax.set_ylabel("Temperature (deg C)")
         ax.grid(True, alpha=0.3)
@@ -230,6 +304,13 @@ def main():
     out_path = args.out or os.path.join(result_dir, "mcl_kz_plot.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved figure to {out_path}")
+
+    coef_fig = plot_coefficients(result, model_datetimes, train_lo, train_hi, test_lo, test_hi)
+    if coef_fig is not None:
+        root, ext = os.path.splitext(out_path)
+        coef_path = f"{root}_coefficients{ext or '.png'}"
+        coef_fig.savefig(coef_path, dpi=150, bbox_inches="tight")
+        print(f"Saved coefficient figure to {coef_path}")
     plt.show()
 
 
