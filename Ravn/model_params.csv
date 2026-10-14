@@ -8,9 +8,9 @@ hydro_res_time,Hydrologic residence time,yr,1.8
 W_str,Wind-derived shear scaling term,Unitless,None
 denThresh,Density threshold for mixing,kg m−3,1.00E-03
 kd_light,Background light attenuation,m−1,0.6
-light_water,Background light extinction,m−1,0.125
-light_doc,DOC light extinction,m−1,0.02
-light_poc,POC light extinction,m−1,0.7
+light_water,Background light extinction,m−1,0.2107380231356628
+light_doc,DOC light extinction,m−1,0.021207052992957
+light_poc,POC light extinction,m−1,0.5716075294821603
 eps,Surface emissivity (for outgoing longwave),Unitless,0.97
 emissivity,Emissivity of water surface,Unitless,0.97
 sigma,Stefan-Boltzmann constant,W m-2 K-4,5.67E-08
@@ -23,7 +23,7 @@ resp_docr,Respiration rate of recalcitrant DOC,day−1,0.005
 resp_docl,Respiration rate of labile DOC,day−1,0.05
 resp_poc,Respiration rate of POC,day−1,0.15
 resp_pocr,Respiration rate of POC,day−1,0.015
-resp_pocl,Respiration rate of POC,day−1,1.4237360375039596e-06
+resp_pocl,Respiration rate of POC,day−1,0.1230107936403421
 sed_sink,Idealized nutrient source rate,g m−2 day−1,-0.0626
 settling_rate_labile,Settling rate of POC,m day−1,0.07
 settling_rate_refractory,Settling rate of POC,m day−1,0.7
