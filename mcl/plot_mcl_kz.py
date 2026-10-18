@@ -20,21 +20,31 @@ Layout (one figure, three rows):
   3. Temperature time series at two depths (`--depths`, default 1,30 m):
      baseline and hybrid model temperature plus the observed record (read
      via `plot_output._load_temperature_observations`, which follows
-     `run_config.csv`'s `u_ini_file` -- run `integrate_buoy_temperature.py`
+     `run_config.csv`'s `u_ini_file` -- run `data_tools.py integrate-buoy`
      once beforehand if the high-frequency buoy record should be included)
      at the nearest observed depth, with the training/test windows shaded
      for reference.
 
 Usage:
-    python src/plot_mcl_kz.py Ravn/mcl_result.npz
+    python mcl/plot_mcl_kz.py mcl/mcl_result_Ravn.npz
         [--depths 1,30] [--n-profile-dates 5] [--profile-dates DATE,DATE,...]
         [--out Ravn/mcl_kz_plot.png]
 """
+# These MCL scripts live in <project>/mcl/; the model code they build on is
+# in <project>/src/, so put that on the import path first.
+import os as _os
+import sys as _sys
+_SRC_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+if _SRC_DIR not in _sys.path:
+    _sys.path.insert(0, _SRC_DIR)
+
 import argparse
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+from data_tools import lake_dir_for_result
 import pandas as pd
 from matplotlib.colors import LogNorm
 
@@ -185,14 +195,20 @@ def main():
                               "the kz(depth) snapshot panels instead of evenly-spaced defaults.")
     parser.add_argument("--observations", type=str, default=None,
                          help="Optional explicit path to a temperature observations CSV; by default "
-                              "it is read from run_config.csv's u_ini_file, looked up beside "
+                              "it is read from run_config.csv's u_ini_file, looked up in the lake folder (--data-dir) of "
                               "mcl_result.npz.")
     parser.add_argument("--out", type=str, default=None,
-                         help="Output image path (default: mcl_kz_plot.png beside mcl_result.npz).")
+                         help="Output image path (default: <result name>_kz_plot.png beside the result).")
+    parser.add_argument("--data-dir", type=str, default=None,
+                         help="lake data folder (run_config.csv, observations); default: the "
+                              "result's folder, or for mcl/<name>_<lake>.npz the folder <lake>")
     args = parser.parse_args()
 
     result = load_mcl_result(args.result_path)
     result_dir = os.path.dirname(os.path.abspath(args.result_path))
+    # lake folder holding run_config.csv / observations: the result's own
+    # folder, or for files in mcl/ the lake named by the _<lake> suffix
+    data_dir = lake_dir_for_result(args.result_path, args.data_dir)
 
     times = result["times"]
     depth = result["depth"]
@@ -204,7 +220,7 @@ def main():
     train_lo, train_hi = int(result["train_lo"]), int(result["train_hi"])
     test_lo, test_hi = int(result["test_lo"]), int(result["test_hi"])
 
-    start_time = _load_start_time(result_dir)
+    start_time = _load_start_time(data_dir)
     model_datetimes = _model_datetimes(times, start_time)
     if model_datetimes is not None:
         model_datetimes = pd.DatetimeIndex(model_datetimes)
@@ -219,7 +235,7 @@ def main():
     if len(requested_depths) != 2:
         parser.error("--depths expects exactly two comma-separated values, e.g. '1,30'")
 
-    observations = _load_temperature_observations(result_dir, args.observations)
+    observations = _load_temperature_observations(data_dir, args.observations)
 
     # --- figure layout ---
     fig = plt.figure(figsize=(20, 17))
@@ -301,7 +317,8 @@ def main():
     fig.suptitle("Process-based vs. LSTM-corrected eddy diffusivity (kz), and resulting temperature fit",
                  fontsize=14)
 
-    out_path = args.out or os.path.join(result_dir, "mcl_kz_plot.png")
+    out_path = args.out or os.path.join(
+        result_dir, os.path.splitext(os.path.basename(args.result_path))[0] + "_kz_plot.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved figure to {out_path}")
 

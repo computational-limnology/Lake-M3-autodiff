@@ -26,8 +26,9 @@ a kink near the thermocline that a 2-coefficient linear-in-depth form
 cannot represent, being monotonic in depth by construction):
 
   * Hybrid/residual, not a full replacement. Every step, the process-based
-    `kz_process` is still computed exactly as before (via `full_step`'s
-    `kz_override` hook -- see its docstring), and the network only supplies
+    `kz_process` is still computed exactly as before (via the experimental
+    `full_step_mcl`'s `kz_override` hook -- see its docstring; the standard
+    `full_step` has no such hook), and the network only supplies
     a *multiplicative* correction, now a degree-`--depth-basis-degree`
     (default 3) polynomial in depth rather than a straight line:
 
@@ -83,8 +84,8 @@ cannot represent, being monotonic in depth by construction):
     2023, `--test-start/--test-end` default 2024) rather than a random
     split: avoids leaking test-period information into the LSTM's
     recurrent state during training, and both years now have full hourly
-    buoy coverage once `integrate_buoy_temperature.py` has been run (see
-    `observation_data.load_buoy_temperature`). The
+    buoy coverage once `data_tools.py integrate-buoy` has been run (see
+    `data_tools.load_buoy_temperature`). The
     physical simulation itself still starts from `run_config.csv`'s own
     `start_time` (2022 here, providing a needed thermal spin-up); only the
     *loss* is restricted to the training window's observations.
@@ -125,7 +126,7 @@ problem than fitting a handful of scalar parameters (see
 script's calibration runs.
 
 Usage:
-    python src/train_M3_mcl_jax.py Ravn [--steps N] [--chunk-steps N]
+    python mcl/train_M3_mcl_jax.py Ravn [--steps N] [--chunk-steps N]
         [--target {kz,ri}]
         [--hidden-size H] [--depth-basis-degree D] [--kz-reg LAMBDA]
         [--ri-k0-init K0] [--ri-alpha-init A] [--ri-n-init N] [--ri-memory-hours H]
@@ -138,11 +139,26 @@ Usage:
         [--train-start DATE --train-end DATE --test-start DATE --test-end DATE]
         [--out result.npz] [--nn-params-out nn_params.pkl]
 
+Outputs (weights + training results) are written to <project>/mcl/ with the
+lake folder's name as suffix, e.g. mcl/mcl_nn_params_Ravn.pkl and
+mcl/mcl_result_Ravn.npz (see data_tools.mcl_path()).
+
+The kz correction runs through `full_step_mcl()`, the experimental copy of
+`full_step()` with the kz_override hook; the baseline uses plain `full_step()`.
+
 Then, to run the trained model standalone (no training, no observations
 needed):
-    python src/run_M3_mcl_jax.py Ravn [--nn-params mcl_nn_params.pkl]
+    python mcl/run_M3_mcl_jax.py Ravn [--nn-params mcl_nn_params.pkl]
         [--steps N] [--chunk-steps N] [--out res_lake1_mcl_hybrid.npz]
 """
+# These MCL scripts live in <project>/mcl/; the model code they build on is
+# in <project>/src/, so put that on the import path first.
+import os as _os
+import sys as _sys
+_SRC_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+if _SRC_DIR not in _sys.path:
+    _sys.path.insert(0, _SRC_DIR)
+
 import argparse
 import os
 import pickle
@@ -165,9 +181,10 @@ from processBased_lakeModel_functions import (
     get_ice_and_snow,
 )
 from jax_lakeModel_functions import (
-    default_params, default_geometry_wq, make_initial_state_full, full_step, calc_dens,
+    default_params, default_geometry_wq, make_initial_state_full, full_step, full_step_mcl, calc_dens,
 )
 from run_M3_jax import build_forcing_series, add_wq_forcing_series
+from data_tools import mcl_path, lake_tag
 from calibrate_M3_jax import (
     load_observations, _rmse, _nse, _kge, _r2,
     DEFAULT_CHUNK_STEPS, DEFAULT_EARLY_STOP_PATIENCE, DEFAULT_EARLY_STOP_TOL,
@@ -795,7 +812,7 @@ def simulate_hybrid(nn_params, phys_params, geometry, forcing, ice_state, init_s
             def kz_override(kz_process, u, ice, dens_u, forcing_step, ri):
                 return jnp.clip(k0 * (1.0 + alpha * ri) ** (-n), min_kz, max_kz)
 
-        new_state, diag = full_step(state, forcing_t, geometry, phys_params, kz_override=kz_override)
+        new_state, diag = full_step_mcl(state, forcing_t, geometry, phys_params, kz_override=kz_override)
         outputs = dict(
             u=new_state.u, o2=new_state.o2, docr=new_state.docr, docl=new_state.docl,
             pocr=new_state.pocr, pocl=new_state.pocl,
@@ -1041,10 +1058,13 @@ def main():
     parser.add_argument("--test-end", type=str, default=DEFAULT_TEST_END)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default="mcl_result.npz",
-                         help="output .npz path (relative to data_dir) with the kz/temperature "
-                              "fields (default mcl_result.npz)")
+                         help="training-result .npz with the kz/temperature fields (default "
+                              "mcl_result.npz). A bare file name is saved as "
+                              "<project>/mcl/<name>_<lake>.npz; a path with a folder is used as given")
     parser.add_argument("--nn-params-out", type=str, default="mcl_nn_params.pkl",
-                         help="pickle path (relative to data_dir) to save the trained NN weights")
+                         help="trained NN weights pickle (default mcl_nn_params.pkl). A bare file "
+                              "name is saved as <project>/mcl/<name>_<lake>.pkl; a path with a "
+                              "folder is used as given")
     parser.add_argument("--depth-coord", choices=DEPTH_COORDS, default=DEFAULT_DEPTH_COORD,
                          help="--target kz only: coordinate of the polynomial log-correction. "
                               "'mixed_layer' (default): depth relative to the current mixed-layer "
@@ -1074,6 +1094,15 @@ def main():
                          help=f"--correction-form additive: cap on softplus(c2), i.e. added mixing <= "
                               f"K_ref * this (default {DEFAULT_MAX_ADD_FACTOR:g})")
     args = parser.parse_args()
+
+    # MCL weights/results go to <project>/mcl/<name>_<lake>.<ext> (bare file
+    # names) -- see data_tools.mcl_path(). Resolved before the chdir below so
+    # explicit relative paths keep meaning "relative to where I ran this".
+    data_dir_abs = os.path.abspath(args.data_dir)
+    out_path = mcl_path(args.out, data_dir_abs)
+    nn_params_path = mcl_path(args.nn_params_out, data_dir_abs)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    os.makedirs(os.path.dirname(nn_params_path), exist_ok=True)
 
     os.chdir(args.data_dir)
     lake_num = 1
@@ -1398,8 +1427,8 @@ def main():
     # from run_M3_jax.py -- with `volume` alongside so consumers (e.g.
     # plot_output.py) can divide down to a concentration the same way they
     # already do for that file.
-    out_path = os.path.join(os.getcwd(), args.out)
     save_kwargs = dict(
+        mcl_lake=np.array(lake_tag(data_dir_abs)),
         times=step_times, depth=np.asarray(depth), volume=np.asarray(volume),
         temp_baseline=np.asarray(baseline["u"]), temp_hybrid=np.asarray(hybrid["u"]),
         kz_baseline=np.asarray(baseline["kz"]),
@@ -1451,9 +1480,9 @@ def main():
     np.savez(out_path, **save_kwargs)
     print(f"\nSaved kz/temperature fields to {out_path}")
 
-    nn_params_path = os.path.join(os.getcwd(), args.nn_params_out)
     with open(nn_params_path, "wb") as f:
         pickle.dump(dict(
+            lake=lake_tag(data_dir_abs),
             nn_params=jax.tree_util.tree_map(np.asarray, nn_params),
             target=args.target,
             hidden_size=args.hidden_size, depth_basis_degree=args.depth_basis_degree,
@@ -1474,7 +1503,7 @@ def main():
         ), f)
     print(f"Saved trained NN weights to {nn_params_path}")
     print(f"Run this trained model standalone with:\n"
-          f"  python src/run_M3_mcl_jax.py {os.path.relpath(os.getcwd())} --nn-params {args.nn_params_out}")
+          f"  python mcl/run_M3_mcl_jax.py <lake folder> --nn-params {nn_params_path}")
 
 
 if __name__ == "__main__":

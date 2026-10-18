@@ -24,14 +24,24 @@ resulting temperature fit); this script is about *why* alpha/n moved the
 way they did, not about the resulting kz or temperature.
 
 Usage:
-    python src/plot_ri_diagnostics.py Ravn/mcl_result.npz
+    python mcl/plot_ri_diagnostics.py mcl/mcl_result_Ravn.npz
         [--start DATE] [--end DATE] [--out Ravn/ri_diagnostics_plot.png]
 """
+# These MCL scripts live in <project>/mcl/; the model code they build on is
+# in <project>/src/, so put that on the import path first.
+import os as _os
+import sys as _sys
+_SRC_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+if _SRC_DIR not in _sys.path:
+    _sys.path.insert(0, _SRC_DIR)
+
 import argparse
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+from data_tools import lake_dir_for_result
 import pandas as pd
 
 from plot_output import _load_start_time, _model_datetimes
@@ -50,11 +60,17 @@ def main():
     parser.add_argument("--start", type=str, default=None, help="Restrict the plot to this start date.")
     parser.add_argument("--end", type=str, default=None, help="Restrict the plot to this end date.")
     parser.add_argument("--out", type=str, default=None,
-                         help="Output image path (default: ri_diagnostics_plot.png beside mcl_result.npz).")
+                         help="Output image path (default: <result name>_ri_diagnostics_plot.png beside the result).")
+    parser.add_argument("--data-dir", type=str, default=None,
+                         help="lake data folder (run_config.csv, observations); default: the "
+                              "result's folder, or for mcl/<name>_<lake>.npz the folder <lake>")
     args = parser.parse_args()
 
     result = load_mcl_result(args.result_path)
     result_dir = os.path.dirname(os.path.abspath(args.result_path))
+    # lake folder holding run_config.csv / observations: the result's own
+    # folder, or for files in mcl/ the lake named by the _<lake> suffix
+    data_dir = lake_dir_for_result(args.result_path, args.data_dir)
 
     missing = [k for k in REQUIRED_KEYS if k not in result]
     if missing:
@@ -78,7 +94,7 @@ def main():
 
     top_minus_bottom_temp = temp_hybrid[:, 0] - temp_hybrid[:, -1]
 
-    start_time = _load_start_time(result_dir)
+    start_time = _load_start_time(data_dir)
     model_datetimes = _model_datetimes(times, start_time)
     if model_datetimes is not None:
         model_datetimes = pd.DatetimeIndex(model_datetimes)
@@ -125,7 +141,8 @@ def main():
     fig.suptitle(title, fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
 
-    out_path = args.out or os.path.join(result_dir, "ri_diagnostics_plot.png")
+    out_path = args.out or os.path.join(
+        result_dir, os.path.splitext(os.path.basename(args.result_path))[0] + "_ri_diagnostics_plot.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved figure to {out_path}")
     plt.show()

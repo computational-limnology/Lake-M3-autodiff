@@ -469,8 +469,8 @@ def eddy_diffusivity(rho, depth, g, rho_0, uvel, vvel, k_min, k_max, alpha, n, r
     This is a separate, independent eddy-diffusivity closure from
     `eddy_diffusivity_hendersonSellers()` -- it is not a drop-in replacement
     and is not wired into `full_step`/`temperature_step` by default (those
-    still use the Henderson-Sellers closure, optionally `kz_override`'d, as
-    before). Use it the same way an MCL `kz_override` is used, or call it
+    still use the Henderson-Sellers closure, or the experimental
+    `full_step_mcl()` with its `kz_override` hook). Use it the same way an MCL `kz_override` is used, or call it
     directly, when real velocity shear (from the Goudsmit momentum fields
     `uvel`/`vvel`) is the desired stratification diagnostic instead of
     Henderson-Sellers' own wind/depth/decay-based internal "Ri" (a
@@ -1758,8 +1758,179 @@ def make_initial_state_full(u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, nx, ice=Fa
     return state
 
 
-def full_step(state, forcing, geometry, params, kz_override=None):
+def full_step(state, forcing, geometry, params):
     """One full timestep: temperature + O2/DOCr/DOCl/POCr/POCl, matching
+    `run_wq_model`'s per-iteration order (see module docstring).
+
+    `geometry` extends the Phase-1 dict with: `hypso_weight`, `depth_mask`
+    (= `depth < mean_depth`, static), `outflow_frac` (static -- see
+    `default_geometry_wq()`), and `altitude`.
+    `forcing` extends the Phase-1 dict with `carbon` and `TP`.
+
+    This is the standard, process-based step used by every non-MCL script
+    (run_M3_jax.py, calibrate_M3_jax.py, attribution/, the MCL baseline
+    runs). The process-based eddy diffusivity is always used as is; the
+    experimental MCL kz-correction hook lives in the separate copy
+    `full_step_mcl()`. Physics changes must be applied to both functions
+    (tests/test_full_step_mcl.py checks that they stay identical when the
+    MCL hook returns kz_process unchanged)."""
+    area, depth, volume = geometry["area"], geometry["depth"], geometry["volume"]
+    dx, dt = geometry["dx"], geometry["dt"]
+    docr, docl, pocr, pocl, o2 = state.docr, state.docl, state.pocr, state.pocl, state.o2
+    # params["wind_factor"] scales the wind speed used everywhere in this
+    # step -- see default_params()'s note on why it's applied here rather
+    # than baked into the forcing series.
+    Uw_eff = forcing["Uw"] * params["wind_factor"]
+
+    # 1. dynamic kd_light from the *previous* step's WQ state
+    depth_mask = geometry["depth_mask"]
+    n_mask = jnp.sum(depth_mask)
+    sum_doc = jnp.where(depth_mask, (docr + docl) / volume, 0.0)
+    sum_poc = jnp.where(depth_mask, (pocr + pocl) / volume, 0.0)
+    kd_light = (
+        params["light_water"]
+        + params["light_doc"] * jnp.sum(sum_doc) / n_mask
+        + params["light_poc"] * jnp.sum(sum_poc) / n_mask
+    )
+
+    # 2. OC river loading (`oc_load_factor` scales the measured "oc"
+    # concentration in oc_load_file.csv -- see default_params() -- treating
+    # the overall carbon-loading boundary condition as a calibratable unknown)
+    perdepth_oc = forcing["carbon"] * params["oc_load_factor"] * geometry["hypso_weight"]
+    docr = docr + perdepth_oc * params["prop_oc_docr"]
+    docl = docl + perdepth_oc * params["prop_oc_docl"]
+    pocr = pocr + perdepth_oc * params["prop_oc_pocr"]
+    pocl = pocl + perdepth_oc * params["prop_oc_pocl"]
+
+    # 3. heating (uses the dynamic kd_light, not a held-constant value)
+    u, IceSnowAttCoeff, Q_net = heating_module(
+        state.u, area, volume, depth, dt, dx, state.ice,
+        forcing["Tair"], forcing["CC"], forcing["ea"], forcing["Jsw"], forcing["Jlw"],
+        Uw_eff, forcing["Pa"], forcing["RH"], kd_light, state.Hi, state.Hs, state.rho_snow,
+        kd_ice=params["kd_ice"], kd_snow=params["kd_snow"], rho_fw=params["rho_fw"],
+        sigma=params["sigma"], eps=params["eps"], emissivity=params["emissivity"], p2=params["p2"],
+        Cd=params["Cd"], sw_factor=params["sw_factor"], at_factor=params["at_factor"],
+        turb_factor=params["turb_factor"], Hgeo=params["Hgeo"],
+    )
+
+    # 4. ice
+    u, Hi, Hs, Hsi, ice, iceT, rho_snow = ice_module(
+        u, dt, dx, area, forcing["Tair"], forcing["CC"], forcing["ea"], forcing["Jsw"], forcing["Jlw"],
+        Uw_eff, forcing["Pa"], forcing["RH"], forcing["PP"], IceSnowAttCoeff,
+        state.ice, params["dt_iceon_avg"], state.iceT, state.rho_snow, state.Hi, state.Hs, state.Hsi,
+        eps=params["eps"], emissivity=params["emissivity"], sigma=params["sigma"], p2=params["p2"],
+        Cd=params["Cd"], rho_new_snow=params["rho_new_snow"], rho_ice=params["rho_ice"],
+        rho_fw=params["rho_fw"], Ice_min=params["Ice_min"], Cw=params["Cw"], L_ice=params["L_ice"],
+        meltP=params["meltP"], K_ice=params["K_ice"],
+    )
+
+    # 5. O2 boundary (atmospheric exchange + sediment oxygen demand)
+    o2, atm_flux, do_consumption = oxygen_boundary_step(
+        u, o2, area, volume, dt, geometry["altitude"], ice, forcing["Pa"], forcing["Tair"], Uw_eff,
+        params["theta_r"], params["f_sod"], params["d_thick"],
+    )
+
+    # 6. mixing (temperature + all 5 WQ tracers, as concentrations)
+    o2c, docrc, doclc, pocrc, poclc = o2 / volume, docr / volume, docl / volume, pocr / volume, pocl / volume
+    u, (o2c, docrc, doclc, pocrc, poclc) = mixing_step(
+        u, depth, area, volume, dx, dt, Uw_eff, ice, g=params["g"], Cd=params["Cd"],
+        W_str=params["W_str"], tracers=(o2c, docrc, doclc, pocrc, poclc),
+    )
+    o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
+    pocr, pocl = pocrc * volume, poclc * volume
+
+    # 7. eddy diffusivity
+    dens_u = calc_dens(u)
+    E_seiche, seiche = _seiche_inputs(state, Uw_eff, area, volume, dx, dt, ice, params)
+    kz_process, ri_process = compute_eddy_diffusivity(
+        params["diffusion_method"],
+        # NOTE: the reference's `run_wq_model` calls this with a hardcoded
+        # latitude (43.100948) instead of the lake's configured latitude,
+        # in every diffusion_method branch (line 4572) -- reproduced here
+        # rather than "fixed" to `geometry["latitude"]`, since the goal is
+        # a numerically matching port (only applies to the "hendersonSellers"
+        # branch -- see compute_eddy_diffusivity()'s docstring).
+        dens_u, depth, params["g"], jnp.mean(dens_u), ice, Uw_eff, geometry["latitude"], u,
+        state.kz, params["Cd"], params["km"], params["weight_kz"],
+        state.uvel, state.vvel, params["k_min"], params["k_max"], params["alpha"], params["n"],
+        return_ri=True, seiche=seiche,
+    )
+    kz = kz_process
+
+    # 8. diffusion (temperature + O2 + DOCr + DOCl, as concentrations)
+    o2c, docrc, doclc = o2 / volume, docr / volume, docl / volume
+    u, o2c, docrc, doclc = diffusion_step_wq(u, o2c, docrc, doclc, kz, area, dx, dt)
+    o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
+
+    # 9. POC settling
+    pocr, pocl = poc_settling_step(
+        pocr, pocl, kz, params["settling_rate_refractory"], params["settling_rate_labile"], dx, dt,
+    )
+
+    # 10. convection (temperature only), this checks for density instabilities
+    u = convection_step(u, volume, denThresh=params["denThresh"], max_outer=params["max_conv_passes"])
+
+    # 11. production/consumption reactions
+    albedo = jnp.where(ice, 0.3, 0.1)
+    H = jnp.where(
+        ice, IceSnowAttCoeff * forcing["Jsw"] * jnp.exp(-kd_light * depth),
+        (1 - albedo) * forcing["Jsw"] * jnp.exp(-kd_light * depth),
+    )
+    # Depth-resolved NPP, computed once here (before prodcons_step) rather
+    # than recomputed per-layer inside it -- the same "compute outside,
+    # feed the result in" pattern step 7 above uses for `kz` before
+    # `diffusion_step_wq()`/`poc_settling_step()`. See compute_npp()'s
+    # docstring.
+    npp = compute_npp(u, area, H, forcing["TP"], params["theta_npp"])
+    o2, docr, docl, pocr, pocl, diag = prodcons_step(
+        u, o2, docr, docl, pocr, pocl, volume, npp, dt,
+        params["theta_r"], params["k_half"],
+        (params["resp_docr"], params["resp_docl"], params["resp_pocr"], params["resp_pocl"]),
+        params["beta"],
+    )
+
+    # 12. hydrologic outflow (DOC/POC only, not O2)
+    outflow_frac = geometry["outflow_frac"]
+    docr = docr * (1 - outflow_frac)
+    docl = docl * (1 - outflow_frac)
+    pocr = pocr * (1 - outflow_frac)
+    pocl = pocl * (1 - outflow_frac)
+
+    # Momentum (uvel/vvel): wind-stress + Coriolis, reusing this step's own
+    # `kz` as the momentum eddy viscosity --
+    # see the module note above `momentum_step()`.
+    uvel, vvel = momentum_step(
+        state.uvel, state.vvel, kz, area, dx, dt, Uw_eff, forcing["WindDir"],
+        geometry["latitude"], params["Cd"], jnp.mean(dens_u),
+        ice=ice, cd_bottom=params["Cd_bottom"], zero_net_transport=params["zero_net_transport"],
+    )
+
+    # Key order must match make_initial_state_full()'s (u,kz,ice,Hi,Hs,Hsi,
+    # iceT,rho_snow,uvel,vvel,o2,docr,docl,pocr,pocl) -- LakeState's pytree
+    # registration uses dict insertion order, and `lax.scan` requires the
+    # carry's pytree structure (incl. key order) to stay identical between
+    # the initial carry and every step's output.
+    new_state = LakeState(
+        u=u, kz=kz, ice=ice, Hi=Hi, Hs=Hs, Hsi=Hsi, iceT=iceT, rho_snow=rho_snow,
+        uvel=uvel, vvel=vvel, E_seiche=E_seiche,
+        o2=o2, docr=docr, docl=docl, pocr=pocr, pocl=pocl,
+    )
+    diagnostics = dict(
+        kd_light=kd_light, atm_flux=atm_flux, kz_process=kz_process, ri_process=ri_process,
+        Q_net=Q_net, npp=npp, **diag,
+    )
+    return new_state, diagnostics
+
+
+def full_step_mcl(state, forcing, geometry, params, kz_override=None):
+    """EXPERIMENTAL (MCL mode): copy of `full_step()` with a hook that lets a
+    machine-learning correction replace the eddy diffusivity. Used only by
+    the MCL scripts (train_M3_mcl_jax.py's hybrid simulation, and through
+    it run_M3_mcl_jax.py). Everything except step 7's kz selection is a
+    verbatim copy of `full_step()`; keep the two in sync when changing
+    physics (tests/test_full_step_mcl.py checks this).
+
+    One full timestep: temperature + O2/DOCr/DOCl/POCr/POCl, matching
     `run_wq_model`'s per-iteration order (see module docstring).
 
     `geometry` extends the Phase-1 dict with: `hypso_weight`, `depth_mask`
@@ -1784,8 +1955,7 @@ def full_step(state, forcing, geometry, params, kz_override=None):
     (surface/bottom temperature, ice state) reflect this step's own state
     rather than the previous step's, and so it can fit a stability function
     directly against `ri` instead of (or as well as) correcting
-    `kz_process`. The default (`kz_override=None`) code path is numerically
-    identical to before this parameter was added."""
+    `kz_process`. With `kz_override=None` the result is identical to `full_step()`."""
     area, depth, volume = geometry["area"], geometry["depth"], geometry["volume"]
     dx, dt = geometry["dx"], geometry["dt"]
     docr, docl, pocr, pocl, o2 = state.docr, state.docl, state.pocr, state.pocl, state.o2

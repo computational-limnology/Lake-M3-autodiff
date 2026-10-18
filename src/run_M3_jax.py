@@ -120,7 +120,7 @@ def _make_chunk_bounds(n_steps, chunk_steps):
     """[(start, end), ...] covering [0, n_steps) in steps of at most
     `chunk_steps` (the last chunk may be shorter). Same idea as
     `calibrate_M3_jax.py`'s `make_chunk_bounds`, duplicated here rather
-    than imported since that module pulls in optax/observation_data for
+    than imported since that module pulls in optax/data_tools for
     calibration-only needs this script has no reason to depend on."""
     bounds = []
     start = 0

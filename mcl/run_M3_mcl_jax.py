@@ -37,7 +37,7 @@ baseline-vs-hybrid training-time comparison file) -- three different files,
 three different names, by design.
 
 Usage:
-    python src/run_M3_mcl_jax.py Ravn [--nn-params mcl_nn_params.pkl]
+    python mcl/run_M3_mcl_jax.py Ravn [--nn-params mcl_nn_params.pkl]   # -> mcl/mcl_nn_params_Ravn.pkl
         [--steps N] [--chunk-steps N] [--out res_lake1_mcl_hybrid.npz]
 
 `--chunk-steps` only controls the memory/`jax.checkpoint` granularity of the
@@ -45,6 +45,14 @@ underlying scan (see `simulate_hybrid()`'s module-level docstring in
 `train_M3_mcl_jax.py`) -- the simulated trajectory is identical regardless
 of its value, since nothing is differentiated through here.
 """
+# These MCL scripts live in <project>/mcl/; the model code they build on is
+# in <project>/src/, so put that on the import path first.
+import os as _os
+import sys as _sys
+_SRC_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+if _SRC_DIR not in _sys.path:
+    _sys.path.insert(0, _SRC_DIR)
+
 import argparse
 import os
 import pickle
@@ -65,6 +73,7 @@ from processBased_lakeModel_functions import (
 )
 from jax_lakeModel_functions import default_params, default_geometry_wq
 from run_M3_jax import build_forcing_series, add_wq_forcing_series
+from data_tools import mcl_path
 from train_M3_mcl_jax import (
     simulate_hybrid, DEFAULT_CHUNK_STEPS,
     DEFAULT_MAX_LOG_K0, DEFAULT_MAX_LOG_ALPHA, DEFAULT_MAX_LOG_N, DEFAULT_MIN_KZ,
@@ -90,8 +99,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("data_dir", nargs="?", default=".")
     parser.add_argument("--nn-params", type=str, default="mcl_nn_params.pkl",
-                         help="path (relative to data_dir) to the trained-weights pickle saved by "
-                              "train_M3_mcl_jax.py's --nn-params-out (default mcl_nn_params.pkl)")
+                         help="trained-weights pickle saved by train_M3_mcl_jax.py (default "
+                              "mcl_nn_params.pkl). A bare file name is read from "
+                              "<project>/mcl/<name>_<lake>.pkl (e.g. mcl_add.pkl -> mcl/mcl_add_Ravn.pkl), or "
+                              "mcl/<name> if that file exists as named (e.g. mcl_rbf9_Ravn.pkl); "
+                              "a path with a folder is used as given, so weights trained on another "
+                              "lake can be loaded with e.g. --nn-params mcl/mcl_nn_params_Mendota.pkl")
     parser.add_argument("--steps", type=int, default=None,
                          help="total simulation window in hourly steps (default: the full record "
                               "per run_config.csv's start_time/end_time) -- need not match the "
@@ -108,9 +121,14 @@ def main():
                               "own mcl_result.npz -- see module docstring")
     args = parser.parse_args()
 
+    nn_params_path = mcl_path(args.nn_params, args.data_dir, reading=True)
+    if not os.path.exists(nn_params_path):
+        legacy = os.path.abspath(os.path.join(args.data_dir, args.nn_params))
+        if not os.path.dirname(args.nn_params) and os.path.exists(legacy):
+            print(f"Note: {nn_params_path} not found; using legacy location {legacy}")
+            nn_params_path = legacy
     os.chdir(args.data_dir)
 
-    nn_params_path = os.path.abspath(args.nn_params)
     if not os.path.exists(nn_params_path):
         raise SystemExit(
             f"{nn_params_path} not found -- train a model first with train_M3_mcl_jax.py "

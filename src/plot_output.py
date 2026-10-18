@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import Normalize
 
-from observation_data import load_run_config, load_temperature_dataframe, load_water_quality_dataframe
+from data_tools import lake_dir_for_result, load_run_config, load_temperature_dataframe, load_water_quality_dataframe
 
 
 def to_numpy(arr):
@@ -109,14 +109,14 @@ def _load_temperature_observations(result_path, observations_path=None):
     """Temperature observations for plotting: `observations_path` if given
     (an explicit `--observations` override), else `run_config.csv`'s
     `u_ini_file` (falling back to `L0001-HD.csv`) via
-    `observation_data.load_temperature_dataframe()` -- the same source
+    `data_tools.load_temperature_dataframe()` -- the same source
     `calibrate_M3_jax.py` trains/calibrates against. If the high-frequency
     buoy thermistor-chain record should be included, run
-    `integrate_buoy_temperature.py` once first to fold it into `u_ini_file`
+    `data_tools.py integrate-buoy` once first to fold it into `u_ini_file`
     directly; this function no longer merges it in separately (it used to,
     via its own copy of that logic, which is how `u_ini_file` ends up with
     everything already merged in the first place)."""
-    result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
+    result_dir = lake_dir_for_result(result_path)  # lake folder (also for results stored in mcl/)
 
     if observations_path is not None:
         if not os.path.exists(observations_path):
@@ -144,11 +144,11 @@ def _load_water_quality_observations(result_path, observations_path=None):
     """Dissolved-oxygen/DOC/POC observations for plotting: `observations_path`
     if given (an explicit `--water-quality-observations` override), else
     `run_config.csv`'s `wq_ini_file` (falling back to `L0001-WQ.csv`) via
-    `observation_data.load_water_quality_dataframe()`. 'poc' is compared
+    `data_tools.load_water_quality_dataframe()`. 'poc' is compared
     against the model's combined `pocr + pocl` the same way 'doc' is
     compared against `docr + docl` -- the observation files in this
     project don't distinguish refractory vs. labile POC, only total POC."""
-    result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
+    result_dir = lake_dir_for_result(result_path)  # lake folder (also for results stored in mcl/)
 
     if observations_path is not None:
         if not os.path.exists(observations_path):
@@ -178,7 +178,7 @@ def _load_water_quality_observations(result_path, observations_path=None):
 
 
 def _load_model_volume(result_path, n_depth):
-    result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
+    result_dir = lake_dir_for_result(result_path)  # lake folder (also for results stored in mcl/)
     volume_path = os.path.join(result_dir, "volume.csv")
     if not os.path.exists(volume_path):
         return None
@@ -190,7 +190,7 @@ def _load_model_volume(result_path, n_depth):
 
 
 def _load_start_time(result_path):
-    result_dir = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
+    result_dir = lake_dir_for_result(result_path)  # lake folder (also for results stored in mcl/)
     run_config_path = os.path.join(result_dir, "run_config.csv")
     if not os.path.exists(run_config_path):
         return None

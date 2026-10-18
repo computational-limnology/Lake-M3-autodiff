@@ -10,15 +10,15 @@ trains its correction on top of the newly calibrated physics rather than
 whatever was on disk before.
 
 Both stages read observed data generically from `run_config.csv`'s
-`u_ini_file`/`wq_ini_file` (via `src/observation_data.py`). If a dataset
+`u_ini_file`/`wq_ini_file` (via `src/data_tools.py`). If a dataset
 has a high-frequency buoy thermistor-chain record (e.g. Ravn's
 `ravn_2023.json`/`ravn_2024.json` + `sensor_level_buoy.sen`) that should be
-included, run `python src/integrate_buoy_temperature.py <data_dir>` once
+included, run `python src/data_tools.py integrate-buoy <data_dir>` once
 beforehand to fold it into `u_ini_file` -- this wrapper does not do that
 merge itself.
 
 Usage:
-    python src/run_M3_calibrate_then_mcl.py Ravn --params Cd,at_factor
+    python mcl/run_M3_calibrate_then_mcl.py Ravn --params Cd,at_factor
         [--cal-steps N] [--cal-chunk-steps N] [--cal-iters K] [--cal-lr LR]
         [--cal-early-stop-patience N] [--cal-early-stop-tol TOL]
         [--cal-variables temp,o2,doc,poc,kd]
@@ -103,6 +103,14 @@ imported directly from the two scripts' own `DEFAULT_*` constants, so this
 wrapper's `--help` output and behavior stay in sync with theirs
 automatically.
 """
+# These MCL scripts live in <project>/mcl/; the model code they build on is
+# in <project>/src/, so put that on the import path first.
+import os as _os
+import sys as _sys
+_SRC_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+if _SRC_DIR not in _sys.path:
+    _sys.path.insert(0, _SRC_DIR)
+
 import argparse
 import os
 import subprocess
@@ -137,7 +145,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def run_calibration_stage(data_dir_abs, args):
-    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "calibrate_M3_jax.py"), data_dir_abs]
+    cmd = [sys.executable, os.path.join(_SRC_DIR, "calibrate_M3_jax.py"), data_dir_abs]
     if args.cal_steps is not None:
         cmd += ["--steps", str(args.cal_steps)]
     cmd += ["--chunk-steps", str(args.cal_chunk_steps)]
@@ -310,8 +318,10 @@ def main():
     mcl.add_argument("--test-start", type=str, default=DEFAULT_TEST_START)
     mcl.add_argument("--test-end", type=str, default=DEFAULT_TEST_END)
     mcl.add_argument("--seed", type=int, default=0)
-    mcl.add_argument("--out", type=str, default="mcl_result.npz")
-    mcl.add_argument("--nn-params-out", type=str, default="mcl_nn_params.pkl")
+    mcl.add_argument("--out", type=str, default="mcl_result.npz",
+                     help="bare name -> <project>/mcl/<name>_<lake>.npz (see data_tools.mcl_path)")
+    mcl.add_argument("--nn-params-out", type=str, default="mcl_nn_params.pkl",
+                     help="bare name -> <project>/mcl/<name>_<lake>.pkl (see data_tools.mcl_path)")
 
     args = parser.parse_args()
 

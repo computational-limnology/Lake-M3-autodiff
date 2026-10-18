@@ -49,7 +49,7 @@ script.
 
 Observation matching: temperature/O2/DOC observations (read from
 `run_config.csv`'s `u_ini_file`/`wq_ini_file` -- `L0001-HD.csv`/
-`L0001-WQ.csv` for Ravn -- via `observation_data.py`, shared with every
+`L0001-WQ.csv` for Ravn -- via `data_tools.py`, shared with every
 other script in this project) are long-format, irregular in both time
 (roughly monthly profile dates) and depth. For each profile date, the
 observed depths are linearly interpolated onto the model's depth grid
@@ -65,9 +65,9 @@ points). Each profile date is mapped to the nearest simulation step via
 The high-frequency buoy thermistor-chain record (`ravn_2023.json`/
 `ravn_2024.json`, plus `sensor_level_buoy.sen` for the sensor->depth
 mapping), where available, is not read directly by this script (or by
-`plot_output.py`): run `integrate_buoy_temperature.py` once first to fold
+`plot_output.py`): run `data_tools.py integrate-buoy` once first to fold
 it into `u_ini_file` itself (see that script's module docstring and
-`observation_data.load_buoy_temperature()`) -- it is a fixed-depth
+`data_tools.load_buoy_temperature()`) -- it is a fixed-depth
 thermistor chain (18 sensors) natively sampled roughly every 15 minutes,
 averaged down to hourly bins, reshaped to the same long-format schema as
 `u_ini_file`, and merged in as one additional "profile" per hourly
@@ -241,7 +241,7 @@ from jax_lakeModel_functions import (
     default_params, default_geometry_wq, make_initial_state_full, full_step,
 )
 from run_M3_jax import build_forcing_series, add_wq_forcing_series
-from observation_data import (
+from data_tools import (
     load_temperature_dataframe, load_water_quality_dataframe,
     load_buoy_temperature,  # noqa: F401 -- re-exported for backward-compat imports of this name
 )
@@ -311,7 +311,7 @@ CANDIDATE_PARAMS = [
     "resp_docr", "resp_docl", "resp_pocr", "resp_pocl",
     "settling_rate_labile", "settling_rate_refractory",
     "f_sod", "d_thick", "meltP", "oc_load_factor", "k_min", "k_max", "alpha", "n", "Cd_bottom",
-    "seiche_alpha", "sbl_drho"
+    "seiche_alpha", "sbl_drho","W_str"
 ]
 
 
@@ -334,10 +334,10 @@ def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_c
     Temperature comes from `run_config`'s `u_ini_file` (falling back to
     `L0001-HD.csv` if `run_config` isn't given) and O2/DOC from
     `wq_ini_file` (falling back to `L0001-WQ.csv`) -- see
-    `observation_data.load_temperature_dataframe()`/
+    `data_tools.load_temperature_dataframe()`/
     `load_water_quality_dataframe()`. If the high-frequency buoy
     thermistor-chain record should be included, run
-    `integrate_buoy_temperature.py` once first to fold `ravn_2023.json`/
+    `data_tools.py integrate-buoy` once first to fold `ravn_2023.json`/
     `ravn_2024.json` into `u_ini_file` directly -- each of its hourly
     timestamps then becomes its own "profile" (matching `u_ini_file`'s
     per-datetime grouping) automatically, with no buoy-specific code
