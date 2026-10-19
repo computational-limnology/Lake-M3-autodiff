@@ -270,7 +270,7 @@ def main():
         out_path = os.path.join(os.getcwd(), "res_lake1_jax_temp.npz")
         np.savez(
             out_path, temp=per_step["u"], uvel=per_step["uvel"], vvel=per_step["vvel"], E_seiche=per_step["E_seiche"],
-            times=step_times, depth=np.asarray(depth),
+            times=step_times, depth=np.asarray(depth), start_time=np.array(str(desired_start)),
         )
         print(f"Saved temperature output to {out_path}")
         return
@@ -329,7 +329,7 @@ def main():
         temp=per_step["u"], o2=per_step["o2"], docr=per_step["docr"],
         docl=per_step["docl"], pocr=per_step["pocr"], pocl=per_step["pocl"],
         uvel=per_step["uvel"], vvel=per_step["vvel"], E_seiche=per_step["E_seiche"],
-        kd_light=per_step["kd_light"],
+        kd_light=per_step["kd_light"], start_time=np.array(str(desired_start)),
         times=step_times, depth=np.asarray(depth), volume=np.asarray(volume),
     )
     print(f"Saved results to {out_path}")

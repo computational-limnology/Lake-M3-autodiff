@@ -714,7 +714,10 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
 
     temp, time_values, depth_values = _apply_orientation(temp, time_values, depth_values)
     n_time, n_depth = temp.shape
-    start_time = _load_start_time(path)
+    # the run's own start_time (saved in newer result files) wins over the
+    # lake's current run_config.csv, which may have been edited since the run
+    start_time = (pd.Timestamp(str(np.asarray(res["start_time"]))) if "start_time" in res
+                  else _load_start_time(path))
     volume = to_numpy(res["volume"]) if "volume" in res else _load_model_volume(path, n_depth)
 
     arrays = _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume, series=series)

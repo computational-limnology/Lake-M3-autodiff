@@ -33,7 +33,7 @@ Usage:
         [--mcl-test-worsen-patience N]
         [--train-start DATE --train-end DATE --test-start DATE --test-end DATE]
         [--seed S] [--out result.npz] [--nn-params-out nn_params.pkl]
-        [--skip-calibration] [--skip-mcl]
+        [--temp-obs {all,profiles}] [--skip-calibration] [--skip-mcl]
 
 Why three stages, and why subprocesses:
 
@@ -161,6 +161,7 @@ def run_calibration_stage(data_dir_abs, args):
         cmd += ["--select-mode", args.cal_select_mode]
     if args.cal_variables:
         cmd += ["--variables", args.cal_variables]
+    cmd += ["--temp-obs", args.temp_obs]
 
     print(f"\n=== Stage 1/3: calibration ===\n$ {' '.join(cmd)}")
     t0 = time.time()
@@ -211,6 +212,7 @@ def run_mcl_stage(data_dir_abs, args):
     cmd += ["--train-start", args.train_start, "--train-end", args.train_end]
     cmd += ["--test-start", args.test_start, "--test-end", args.test_end]
     cmd += ["--seed", str(args.seed)]
+    cmd += ["--temp-obs", args.temp_obs]
     cmd += ["--out", args.out, "--nn-params-out", args.nn_params_out]
 
     print(f"\n=== Stage 3/3: LSTM kz-correction training ===\n$ {' '.join(cmd)}")
@@ -318,6 +320,9 @@ def main():
     mcl.add_argument("--test-start", type=str, default=DEFAULT_TEST_START)
     mcl.add_argument("--test-end", type=str, default=DEFAULT_TEST_END)
     mcl.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--temp-obs", choices=("all", "profiles"), default="all",
+                        help="temperature observations for BOTH stages: 'all' (default) or 'profiles' "
+                             "(sparse manual profiles only, high_frequency == 0)")
     mcl.add_argument("--out", type=str, default="mcl_result.npz",
                      help="bare name -> <project>/mcl/<name>_<lake>.npz (see data_tools.mcl_path)")
     mcl.add_argument("--nn-params-out", type=str, default="mcl_nn_params.pkl",

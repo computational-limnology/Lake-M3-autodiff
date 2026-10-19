@@ -280,6 +280,7 @@ def main():
     # diagnostics and explicit MCL provenance fields (see module docstring).
     out_path = os.path.join(os.getcwd(), args.out)
     save_kwargs = dict(
+        start_time=np.array(str(desired_start)),
         temp=np.asarray(hybrid["u"]), o2=np.asarray(hybrid["o2"]),
         docr=np.asarray(hybrid["docr"]), docl=np.asarray(hybrid["docl"]),
         pocr=np.asarray(hybrid["pocr"]), pocl=np.asarray(hybrid["pocl"]),

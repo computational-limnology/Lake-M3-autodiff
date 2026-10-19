@@ -12,6 +12,7 @@ Run the one-off data-prep steps through its subcommands:
     python src/data_tools.py fix-surface     Mendota/ME_obs_depths3_wpoc.csv [--variable do|poc] [--out PATH] [--no-backup]
     python src/data_tools.py integrate-buoy  Ravn    [--json-files a.json,b.json] [--sensor-file F] [--out PATH] [--no-backup]
     python src/data_tools.py integrate-ntl   Mendota [--ntl-file F] [--out PATH] [--no-backup]
+    python src/data_tools.py flag-hf         Ravn    [--out PATH] [--no-backup]
 
 Sections
 --------
@@ -35,7 +36,13 @@ Sections
 4. High-frequency temperature merges (integrate-buoy / integrate-ntl): fold
    a buoy record into the `u_ini_file` named by run_config.csv, so every
    script reads one temperature file. The merge is additive; on an exact
-   (datetime, depth) duplicate the original file's value is kept.
+   (datetime, depth) duplicate the original file's value is kept. Added rows
+   get high_frequency = 1.
+5. High-frequency flag (flag-hf): adds/refreshes the `high_frequency` column
+   (1 = buoy/NTL row, 0 = sparse profile) in an already merged u_ini_file,
+   by matching rows against the raw high-frequency record.
+   load_temperature_dataframe(..., temp_obs="profiles") uses it to drop the
+   high-frequency rows (calibrate/train: --temp-obs profiles).
 
 All in-place writers save a `.bak` copy first unless --no-backup is given;
 --out writes elsewhere instead (run_config.csv is then not updated).
@@ -163,14 +170,26 @@ def resolve_data_path(data_dir, run_config, key, default_filename):
     return os.path.join(data_dir, name)
 
 
-def load_temperature_dataframe(data_dir, run_config=None):
+HF_FLAG = "high_frequency"   # u_ini_file column: 1 = high-frequency buoy row, 0 = sparse profile
+TEMP_OBS_CHOICES = ("all", "profiles")
+
+
+def load_temperature_dataframe(data_dir, run_config=None, temp_obs="all"):
     """Read `run_config`'s `u_ini_file` (falling back to `L0001-HD.csv`) as
     a long-format `(datetime, Depth_meter, Water_Temperature_celsius)`
     DataFrame -- the single source of temperature observations for every
     script in this project. If the high-frequency buoy record should be
     included, run `data_tools.py integrate-buoy` once first to fold it
     into this same file; this function does not look for the buoy JSON
-    files itself. Returns `None` if the file doesn't exist."""
+    files itself. Returns `None` if the file doesn't exist.
+
+    `temp_obs`: "all" (default) returns every row; "profiles" drops the rows
+    flagged as high-frequency (`high_frequency == 1`, set by
+    `data_tools.py flag-hf` / integrate-buoy / integrate-ntl), keeping only
+    the sparse manual profiles. The `high_frequency` column is passed
+    through when the file has it."""
+    if temp_obs not in TEMP_OBS_CHOICES:
+        raise ValueError(f"temp_obs must be one of {TEMP_OBS_CHOICES}, got {temp_obs!r}")
     path = resolve_data_path(data_dir, run_config, "u_ini_file", "L0001-HD.csv")
     if not os.path.exists(path):
         return None
@@ -181,7 +200,16 @@ def load_temperature_dataframe(data_dir, run_config=None):
         raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
     df = df.copy()
     df["datetime"] = pd.to_datetime(df["datetime"])
-    return df[["datetime", "Depth_meter", "Water_Temperature_celsius"]]
+    cols = ["datetime", "Depth_meter", "Water_Temperature_celsius"]
+    if HF_FLAG in df.columns:
+        cols.append(HF_FLAG)
+    if temp_obs == "profiles":
+        if HF_FLAG not in df.columns:
+            raise ValueError(
+                f"{path} has no '{HF_FLAG}' column, so high-frequency rows can't be told apart -- "
+                f"run `python src/data_tools.py flag-hf <lake folder>` first.")
+        df = df[df[HF_FLAG].fillna(0).astype(int) == 0]
+    return df[cols]
 
 
 def load_water_quality_dataframe(data_dir, run_config=None):
@@ -439,14 +467,20 @@ def merge_temperature_observations(original, buoy_long):
     (as read from `u_ini_file`) with `buoy_long` (see
     `data_tools.load_buoy_temperature`), drop exact
     `(datetime, Depth_meter)` duplicates keeping `original`'s own row, and
-    return the merged, time-sorted DataFrame with the same 3-column schema
-    both inputs share."""
+    return the merged, time-sorted DataFrame. The `high_frequency` column
+    marks the added rows with 1; original rows keep their flag (0 if the
+    file had none)."""
     required = {"datetime", "Depth_meter", "Water_Temperature_celsius"}
     missing = required.difference(original.columns)
     if missing:
         raise ValueError(f"Existing temperature file is missing required columns: {sorted(missing)}")
-    original = original[["datetime", "Depth_meter", "Water_Temperature_celsius"]].copy()
+    keep = ["datetime", "Depth_meter", "Water_Temperature_celsius"]
+    original = original[keep + ([HF_FLAG] if HF_FLAG in original.columns else [])].copy()
     original["datetime"] = pd.to_datetime(original["datetime"])
+    if HF_FLAG not in original.columns:
+        original[HF_FLAG] = 0
+    buoy_long = buoy_long[keep].copy()
+    buoy_long[HF_FLAG] = 1   # rows added from a high-frequency record
 
     merged = pd.concat([original, buoy_long], ignore_index=True)
     merged = merged.sort_values(["datetime", "Depth_meter"], kind="stable")
@@ -524,6 +558,67 @@ def _cli_integrate_ntl(args):
               f"'{os.path.relpath(out_path, args.data_dir)}' if you want the rest of the pipeline "
               "to pick up the merged file.")
 
+
+# ===========================================================================
+# 5. Flag high-frequency rows in an existing u_ini_file (flag-hf)
+# ===========================================================================
+
+def flag_high_frequency(original, hf_long, tol=1e-6):
+    """Return `original` with a `high_frequency` column: 1 where the row is a
+    high-frequency record row, 0 for sparse profile rows.
+
+    A row counts as high-frequency when its (datetime, Depth_meter) occurs
+    in `hf_long` (the raw buoy/NTL record, reloaded) AND its value equals
+    that record's value (within `tol`) or is NaN (QC-removed buoy values).
+    Where a manual profile coincides with a buoy hour the merge kept the
+    manual value, which differs from the buoy value, so it stays 0."""
+    df = original.copy()
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    ref = hf_long[["datetime", "Depth_meter", "Water_Temperature_celsius"]].rename(
+        columns={"Water_Temperature_celsius": "_hf_value"})
+    ref = ref.drop_duplicates(subset=["datetime", "Depth_meter"])
+    m = df.merge(ref, on=["datetime", "Depth_meter"], how="left")
+    in_hf = m["_hf_value"].notna().to_numpy()
+    val = m["Water_Temperature_celsius"].to_numpy(float)
+    same = np.isnan(val) | (np.abs(val - m["_hf_value"].to_numpy(float)) <= tol)
+    df[HF_FLAG] = (in_hf & same).astype(int)
+    return df
+
+
+def _cli_flag_hf(args):
+    run_config = load_run_config(args.data_dir, args.lake)
+    path = resolve_data_path(args.data_dir, run_config, "u_ini_file", "L0001-HD.csv")
+    if not os.path.exists(path):
+        raise SystemExit(f"{path} (u_ini_file) does not exist.")
+    sources = []
+    buoy = load_buoy_temperature(args.data_dir, json_files=tuple(
+        f.strip() for f in args.json_files.split(",") if f.strip()), sensor_file=args.sensor_file)
+    if buoy is not None:
+        sources.append(("buoy JSON", buoy))
+    ntl = load_ntl_high_frequency_temperature(args.data_dir, filename=args.ntl_file)
+    if ntl is not None:
+        sources.append(("NTL", ntl))
+    if not sources:
+        raise SystemExit(f"No high-frequency source found in {args.data_dir} (buoy JSON + sensor file, "
+                         f"or {args.ntl_file}) -- nothing to flag against.")
+    hf_long = pd.concat([d for _, d in sources], ignore_index=True)
+    original = pd.read_csv(path)
+    flags = flag_high_frequency(original, hf_long)[HF_FLAG].to_numpy()
+    # write the original text of every cell back unchanged (re-printing the
+    # parsed floats would change their last digits), plus the flag column
+    raw = pd.read_csv(path, dtype=str, keep_default_na=False)
+    raw[HF_FLAG] = flags
+    flagged = raw
+    out_path = args.out or path
+    if not args.out and not args.no_backup:
+        backup_path = path + ".pre_hfflag"
+        shutil.copy(path, backup_path)
+        print(f"Backed up original to {backup_path}")
+    flagged.to_csv(out_path, index=False)
+    n_hf = int(flagged[HF_FLAG].sum())
+    print(f"Flagged {n_hf} of {len(flagged)} rows as high-frequency ({', '.join(n for n, _ in sources)}); "
+          f"{len(flagged) - n_hf} sparse-profile rows -> {out_path}")
+
 # ===========================================================================
 # Command line
 # ===========================================================================
@@ -565,6 +660,17 @@ def main(argv=None):
     p.add_argument("--out", type=str, default=None, help="write here instead of overwriting u_ini_file")
     p.add_argument("--no-backup", action="store_true", help="skip the .bak backup (ignored with --out)")
     p.set_defaults(func=_cli_integrate_ntl)
+
+    p = sub.add_parser("flag-hf", help="add a high_frequency (1/0) column to u_ini_file marking buoy rows")
+    p.add_argument("data_dir", nargs="?", default=".", help="lake folder with run_config.csv")
+    p.add_argument("--lake", type=int, default=1, help="lake/column number in run_config.csv (default 1)")
+    p.add_argument("--json-files", type=str, default=",".join(DEFAULT_JSON_FILES),
+                   help="buoy JSON files in data_dir (Ravn-style chain)")
+    p.add_argument("--sensor-file", type=str, default=DEFAULT_SENSOR_FILE, help="sensor->depth mapping file")
+    p.add_argument("--ntl-file", type=str, default=DEFAULT_NTL_FILE, help="NTL export (Mendota-style)")
+    p.add_argument("--out", type=str, default=None, help="write here instead of overwriting u_ini_file")
+    p.add_argument("--no-backup", action="store_true", help="skip the .pre_hfflag backup (ignored with --out)")
+    p.set_defaults(func=_cli_flag_hf)
 
     args = parser.parse_args(argv)
     args.func(args)

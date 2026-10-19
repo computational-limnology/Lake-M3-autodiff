@@ -242,7 +242,7 @@ from jax_lakeModel_functions import (
 )
 from run_M3_jax import build_forcing_series, add_wq_forcing_series
 from data_tools import (
-    load_temperature_dataframe, load_water_quality_dataframe,
+    load_temperature_dataframe, load_water_quality_dataframe, TEMP_OBS_CHOICES,
     load_buoy_temperature,  # noqa: F401 -- re-exported for backward-compat imports of this name
 )
 
@@ -323,13 +323,17 @@ CANDIDATE_PARAMS = [
 OBS_VARIABLES = ("temp", "o2", "doc", "poc", "kd")
 
 
-def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_config=None):
+def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_config=None, temp_obs="all"):
     """Load temperature/O2/DOC observations, restrict to the simulation
     window, and build per-variable dicts of (step_idx, values, mask)
     arrays on the model's depth grid. `values` are in the model's own
     units: degC for temperature, mass (obs_mgL * volume) for o2/doc.
     Returns a dict with keys "temp", "o2", "doc" (each None if no
     observations fall in the simulation window).
+
+    `temp_obs`: "all" (default) uses every temperature row of u_ini_file;
+    "profiles" drops the high-frequency buoy rows (high_frequency == 1, see
+    `data_tools.py flag-hf`) and keeps only the sparse manual profiles.
 
     Temperature comes from `run_config`'s `u_ini_file` (falling back to
     `L0001-HD.csv` if `run_config` isn't given) and O2/DOC from
@@ -412,7 +416,7 @@ def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_c
             mask=jnp.asarray(np.ones(len(idxs), dtype=bool)),
         )
 
-    hd = load_temperature_dataframe(data_dir, run_config)
+    hd = load_temperature_dataframe(data_dir, run_config, temp_obs=temp_obs)
     temp_obs = build(hd, "Depth_meter", "Water_Temperature_celsius", mass_convert=False) if hd is not None else None
 
     wq = load_water_quality_dataframe(data_dir, run_config)
@@ -766,6 +770,11 @@ def main():
     parser.add_argument("--params", type=str, default=None,
                          help="comma-separated parameter names to calibrate directly, "
                               "bypassing the sensitivity screen")
+    parser.add_argument("--temp-obs", choices=TEMP_OBS_CHOICES, default="all",
+                         help="temperature observations from u_ini_file to calibrate against: 'all' "
+                              "(default; sparse profiles + high-frequency buoy rows) or 'profiles' "
+                              "(only rows with high_frequency == 0; needs the flag column, see "
+                              "`python src/data_tools.py flag-hf <lake>`)")
     parser.add_argument("--variables", type=str, default=None,
                          help="comma-separated subset of temp,o2,doc,poc,kd to calibrate against "
                               "(default: all of temp/o2/doc/poc/kd that have observations in the "
@@ -845,7 +854,10 @@ def main():
     print(f"Loading observations and restricting to the {n_steps}-step "
           f"({n_steps * dt / 86400:.0f}-day) simulation window "
           f"({n_chunks} chunk(s) of up to {args.chunk_steps} steps for gradient truncation)...")
-    obs = load_observations("./", depth, volume, desired_start, step_times, dt, run_config=run_config)
+    obs = load_observations("./", depth, volume, desired_start, step_times, dt, run_config=run_config,
+                            temp_obs=args.temp_obs)
+    print(f"Temperature observations: {args.temp_obs}"
+          + (" (sparse profiles only, high-frequency rows excluded)" if args.temp_obs == "profiles" else ""))
     for name in OBS_VARIABLES:
         n = int(obs[name]["step_idx"].shape[0]) if obs[name] is not None else 0
         print(f"  {name}: {n} profile date(s) in window")

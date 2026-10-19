@@ -184,7 +184,7 @@ from jax_lakeModel_functions import (
     default_params, default_geometry_wq, make_initial_state_full, full_step, full_step_mcl, calc_dens,
 )
 from run_M3_jax import build_forcing_series, add_wq_forcing_series
-from data_tools import mcl_path, lake_tag
+from data_tools import mcl_path, lake_tag, TEMP_OBS_CHOICES
 from calibrate_M3_jax import (
     load_observations, _rmse, _nse, _kge, _r2,
     DEFAULT_CHUNK_STEPS, DEFAULT_EARLY_STOP_PATIENCE, DEFAULT_EARLY_STOP_TOL,
@@ -1057,6 +1057,11 @@ def main():
     parser.add_argument("--test-start", type=str, default=DEFAULT_TEST_START)
     parser.add_argument("--test-end", type=str, default=DEFAULT_TEST_END)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--temp-obs", choices=TEMP_OBS_CHOICES, default="all",
+                         help="temperature observations from u_ini_file to train (and evaluate) "
+                              "against: 'all' (default; sparse profiles + high-frequency buoy rows) or "
+                              "'profiles' (only rows with high_frequency == 0; see "
+                              "`python src/data_tools.py flag-hf <lake>`)")
     parser.add_argument("--out", type=str, default="mcl_result.npz",
                          help="training-result .npz with the kz/temperature fields (default "
                               "mcl_result.npz). A bare file name is saved as "
@@ -1184,7 +1189,10 @@ def main():
                           "or --steps.")
 
     print("Loading temperature observations (run_config.csv's u_ini_file)...")
-    obs = load_observations("./", depth, volume, desired_start, step_times, dt, run_config=run_config)
+    obs = load_observations("./", depth, volume, desired_start, step_times, dt, run_config=run_config,
+                            temp_obs=args.temp_obs)
+    print(f"Temperature observations: {args.temp_obs}"
+          + (" (sparse profiles only, high-frequency rows excluded)" if args.temp_obs == "profiles" else ""))
     obs_train = split_obs_by_step_range(obs["temp"], train_lo, train_hi)
     obs_test = split_obs_by_step_range(obs["temp"], test_lo, test_hi)
     if obs_train is None:
@@ -1429,6 +1437,8 @@ def main():
     # already do for that file.
     save_kwargs = dict(
         mcl_lake=np.array(lake_tag(data_dir_abs)),
+        start_time=np.array(str(desired_start)),
+        mcl_temp_obs=np.array(args.temp_obs),
         times=step_times, depth=np.asarray(depth), volume=np.asarray(volume),
         temp_baseline=np.asarray(baseline["u"]), temp_hybrid=np.asarray(hybrid["u"]),
         kz_baseline=np.asarray(baseline["kz"]),
@@ -1483,6 +1493,7 @@ def main():
     with open(nn_params_path, "wb") as f:
         pickle.dump(dict(
             lake=lake_tag(data_dir_abs),
+            temp_obs=args.temp_obs,
             nn_params=jax.tree_util.tree_map(np.asarray, nn_params),
             target=args.target,
             hidden_size=args.hidden_size, depth_basis_degree=args.depth_basis_degree,
