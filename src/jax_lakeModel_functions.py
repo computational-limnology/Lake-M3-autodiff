@@ -280,13 +280,23 @@ def bulk_fluxes(Tair, Twater, Uw, pa, RH, Cd=0.0013, z0_iters=50, l_iters=20):
 
     H_init = rho_a * const_cp * C_HN * U_Z * (T0 - T)
     E_init = rho_a * L_v * C_EN * U_Z * (q_s - q_z)
-    L_init = (-rho_a * u_star ** 3 * T_v) / (
-        k_von * g * (H_init / const_cp + 0.61 * E_init * (T + 273.16) / L_v)
-    )
+    # The Obukhov length L = -rho u*^3 T_v / (k g (H/cp + 0.61 E T/L_v)) is
+    # carried as its inverse 1/L. With L itself, a step where both fluxes are
+    # exactly zero (Tair == Twater and RH = 100 %, e.g. 2011-01-13 08:00 on
+    # Ravn: Tair = 0.0 over ice, whose surface is held at 0 degC) gives
+    # L = +-inf; zeta = z/L = 0 is fine forward, but the gradient is
+    # d(z/L)/dL * dL/dflux = 0 * inf = NaN, which poisoned every
+    # wind-related gradient (Cd, wind_factor) of a whole calibration.
+    # 1/L is finite for any fluxes (u* > 0), and zeta = z * (1/L) is the same
+    # value (zeta = 0 at zero flux, as before).
+    def inv_obukhov(u_star, H, E):
+        return -(k_von * g * (H / const_cp + 0.61 * E * (T + 273.16) / L_v)) / (rho_a * u_star ** 3 * T_v)
+
+    invL_init = inv_obukhov(u_star, H_init, E_init)
 
     def l_body(_, carry):
-        u_star, L, H, E = carry
-        zeta = jnp.clip(z / L, -15.0, 15.0)
+        u_star, invL, H, E = carry
+        zeta = jnp.clip(z * invL, -15.0, 15.0)
         psim = _psim(zeta)
         psit = _psite(zeta)
         psie = _psite(zeta)
@@ -300,12 +310,9 @@ def bulk_fluxes(Tair, Twater, Uw, pa, RH, Cd=0.0013, z0_iters=50, l_iters=20):
         H_new = rho_a * const_cp * C_H * U_Z * (T0 - T)
         E_new = rho_a * L_v * C_E * U_Z * (q_s - q_z)
         u_star_new = jnp.sqrt(C_D * U_Z ** 2)
-        L_new = (-rho_a * u_star_new ** 3 * T_v) / (
-            k_von * g * (H_new / const_cp + 0.61 * E_new * (T + 273.16) / L_v)
-        )
-        return (u_star_new, L_new, H_new, E_new)
+        return (u_star_new, inv_obukhov(u_star_new, H_new, E_new), H_new, E_new)
 
-    _, _, H, E = lax.fori_loop(0, l_iters, l_body, (u_star, L_init, H_init, E_init))
+    _, _, H, E = lax.fori_loop(0, l_iters, l_body, (u_star, invL_init, H_init, E_init))
 
     return -H, -E
 
