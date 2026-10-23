@@ -689,8 +689,63 @@ def _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume=None, s
     return arrays
 
 
+def _plot_layer_bias_map(temp, time_values, depth_values, observations, start_time, obs_mode="profiles",
+                         label="model", save_path=None):
+    """Year x month map of the mean temperature bias (model - observed) in
+    three layers: epilimnion 0-5 m, metalimnion 5-15 m, hypolimnion > 15 m
+    (same layout as diagnose_temperature_errors.py's B_bias_map). Each
+    observation is matched to the nearest model hour and layer.
+
+    `obs_mode`: "profiles" (default) uses only rows with high_frequency == 0
+    (sparse manual profiles) when the observation file has that flag; "all"
+    uses every row."""
+    if observations is None or observations.empty or depth_values is None or start_time is None:
+        print("Layer bias map skipped (needs observations, depths and a start time).")
+        return None
+    obs = observations
+    if obs_mode == "profiles":
+        if "high_frequency" in obs.columns:
+            obs = obs[obs["high_frequency"].fillna(0).astype(int) == 0]
+        else:
+            print("Layer bias map: no high_frequency column in the observations -- using all rows.")
+    obs, model_datetimes = _filter_to_modeled_period(obs, time_values, start_time)
+    if model_datetimes is None or obs.empty:
+        print("Layer bias map skipped (no observations in the modelled period).")
+        return None
+    observed, modeled = _match_model_to_observations(
+        temp, np.asarray(depth_values, float), pd.DatetimeIndex(model_datetimes), obs,
+        "Water_Temperature_celsius")
+    df = pd.DataFrame({
+        "year": obs["datetime"].dt.year.to_numpy(), "month": obs["datetime"].dt.month.to_numpy(),
+        "depth": obs["Depth_meter"].to_numpy(float), "resid": modeled - observed,
+    })
+    df["layer"] = pd.cut(df["depth"], [-1, 5, 15, 1e9], labels=["epi", "meta", "hypo"], right=False)
+    years = np.arange(df["year"].min(), df["year"].max() + 1)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, max(4.5, 0.17 * len(years) + 1.5)), sharey=True)
+    im = None
+    for ax, (layer, rng) in zip(axes, (("epi", "0-5 m"), ("meta", "5-15 m"), ("hypo", "> 15 m"))):
+        m = (df[df["layer"] == layer].pivot_table(index="year", columns="month", values="resid", aggfunc="mean")
+             .reindex(index=years, columns=range(1, 13)))
+        im = ax.imshow(m.to_numpy(), aspect="auto", cmap="RdBu_r", vmin=-4, vmax=4,
+                       extent=(0.5, 12.5, years[-1] + 0.5, years[0] - 0.5), interpolation="nearest")
+        r = df.loc[df["layer"] == layer, "resid"]
+        ax.set_title(f"{layer} ({rng})\nbias {r.mean():+.2f}, RMSE {np.sqrt(np.mean(r ** 2)):.2f} degC (n={len(r)})",
+                     fontsize=10)
+        ax.set_xlabel("month")
+        ax.set_xticks(range(1, 13))
+    axes[0].set_ylabel("year")
+    fig.colorbar(im, ax=axes, label="model - observed (degC)", fraction=0.02)
+    fig.suptitle(f"{label}: temperature bias (model - observed) by layer, year and month"
+                 + (" -- manual profiles only" if obs_mode == "profiles" else " -- all observations"), y=1.04)
+    if save_path:
+        fig.savefig(save_path, dpi=130, bbox_inches="tight")
+        print(f"Saved layer bias map to {save_path}")
+    return fig
+
+
 def plot_result(path, observations_path=None, water_quality_observations_path=None, depths=None,
-                 series=None):
+                 series=None, bias_map_obs="profiles"):
     res = load_result(path)
     if not isinstance(res, dict):
         raise TypeError(f"Expected a dictionary-like result, got {type(res).__name__}")
@@ -770,6 +825,12 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
     plt.tight_layout()
     observations = _load_temperature_observations(path, observations_path)
     _plot_temperature_profiles(temp, time_values, depth_values, observations, start_time, depths=depths)
+    if bias_map_obs != "none":
+        resolved = _resolve_input_path(path)
+        _plot_layer_bias_map(
+            temp, time_values, depth_values, observations, start_time, obs_mode=bias_map_obs,
+            label=os.path.splitext(os.path.basename(resolved))[0],
+            save_path=os.path.splitext(resolved)[0] + "_bias_map.png" if os.path.isfile(resolved) else None)
 
     water_quality_observations = _load_water_quality_observations(
         path, water_quality_observations_path
@@ -894,6 +955,14 @@ def main():
         "single 'temp'/'o2'/'docr'/'docl' keys. Picks which one this script uses for all of "
         "them (default: hybrid). Ignored for a plain result file that already has plain keys.",
     )
+    parser.add_argument(
+        "--bias-map-obs",
+        choices=["profiles", "all", "none"],
+        default="profiles",
+        help="Observations for the year x month layer bias map (also saved as "
+        "<result>_bias_map.png): 'profiles' (default; only high_frequency == 0 rows, i.e. "
+        "without the buoy record), 'all', or 'none' to skip it.",
+    )
     args = parser.parse_args()
 
     depths = None
@@ -908,7 +977,7 @@ def main():
 
     plot_result(
         args.path, args.observations, args.water_quality_observations, depths=depths,
-        series=args.series,
+        series=args.series, bias_map_obs=args.bias_map_obs,
     )
 
 
