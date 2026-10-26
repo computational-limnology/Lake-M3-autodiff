@@ -207,6 +207,24 @@ it's clear they didn't influence the fit. Requesting a variable with no
 observations in the window is an error (nothing to calibrate against for
 it), rather than silently ignored.
 
+Windowed calibration (`--windows years`, requires `--params`): instead of
+one continuous run per iteration, the loss is computed on independent yearly
+windows (default 1 Feb + 8016 h, first 28 days unscored), each started from
+the model state of a continuous reference run on its start date, and run in
+parallel over CPU devices (`--devices N [--single-thread]`; see
+src/windows.py). Only years with scored observations are used;
+`--test-years 2016,2018` or `every:4` holds years out and reports their loss.
+The reference run is repeated every `--refresh-every` iterations so the start
+states follow the parameters; the best parameters are then re-scored, since
+losses with different start states aren't comparable, and the end of the run
+reports initial vs best on the same start states. `--windows-per-iter K`
+uses a random K-window subset per iteration. `--check-window-gradient`
+compares the windowed gradient with the continuous-run gradient first.
+Example (14 cores):
+    python src/calibrate_M3_jax.py Ravn --variables temp --temp-obs profiles \
+        --params sw_factor,wind_factor,k_max,seiche_alpha --windows years \
+        --devices 14 --single-thread --test-years every:4 --check-window-gradient
+
 Evaluation: after optimization, the model is run once more at the initial
 and at the calibrated parameters, and RMSE, NSE (Nash-Sutcliffe
 efficiency), KGE (Kling-Gupta efficiency), and R^2 (squared Pearson
@@ -221,6 +239,25 @@ import argparse
 import os
 import time
 from copy import deepcopy
+
+import sys
+
+
+def _early_device_flags(argv):
+    """--devices N / --single-thread (windowed calibration) have to reach XLA
+    before JAX is imported, so they're read from sys.argv here."""
+    flags = os.environ.get("XLA_FLAGS", "")
+    if "--devices" in argv:
+        n = int(argv[argv.index("--devices") + 1])
+        if n > 1 and "xla_force_host_platform_device_count" not in flags:
+            flags += f" --xla_force_host_platform_device_count={n}"
+    if "--single-thread" in argv and "xla_cpu_multi_thread_eigen" not in flags:
+        flags += " --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+    os.environ["XLA_FLAGS"] = flags.strip()
+
+
+if __name__ == "__main__":
+    _early_device_flags(sys.argv)
 
 import numpy as np
 import pandas as pd
@@ -723,6 +760,98 @@ def make_per_variable_loss_fn(base_params, geometry, forcing, ice_state, init_st
     return fn
 
 
+# ---------------------------------------------------------------------------
+# Windowed calibration (--windows years): see src/windows.py
+# ---------------------------------------------------------------------------
+
+VAR_FIELDS = {"temp": ("u",), "o2": ("o2",), "doc": ("docr", "docl"), "poc": ("pocr", "pocl"),
+              "kd": ("kd_light",)}
+
+
+def parse_test_years(spec, years):
+    """'' -> none; 'every:N' -> every N-th window year (counting from the
+    first); otherwise a comma-separated list of years."""
+    if not spec:
+        return set()
+    if spec.startswith("every:"):
+        n = int(spec.split(":", 1)[1])
+        return {y for i, y in enumerate(sorted(years)) if i % n == n - 1}
+    return {int(y) for y in spec.split(",") if y.strip()}
+
+
+class WindowedLoss:
+    """The calibration loss evaluated on independent yearly windows (each
+    started from a saved state of a continuous reference run) instead of one
+    continuous run. Same loss as make_loss_fn -- weights[var] * sum of squared
+    errors / number of scored values, per variable -- pooled over the windows,
+    with observations inside each window's spin-up not scored."""
+
+    def __init__(self, W, setup, windows_df, active_vars, obs, weights, chunk_steps, window_steps,
+                 n_devices, seed=0):
+        self.W, self.S, self.win = W, setup, windows_df.reset_index(drop=True)
+        self.vars = list(active_vars)
+        self.weights = {v: float(weights[v]) for v in self.vars}
+        self.window_steps = window_steps
+        self.n_devices = n_devices
+        self.rng = np.random.default_rng(seed)
+        fields = tuple(dict.fromkeys(f for v in self.vars for f in VAR_FIELDS[v]))
+        self.sim = W.make_window_simulator(setup["geom"], setup["params"], chunk_steps=chunk_steps, outputs=fields)
+        self.F = W.window_forcing(setup["forcing"], self.win, window_steps)
+        self.OBS = {}
+        for v in self.vars:
+            o = W.window_obs(obs[v], self.win)
+            m = o["mask"] & (o["valid"].reshape(o["valid"].shape + (1,) * (o["mask"].ndim - 2)))
+            self.OBS[v] = dict(idx=o["step_idx"], val=o["values"], mask=m.astype(float))
+        self.counts = {v: self.OBS[v]["mask"].reshape(len(self.win), -1).sum(axis=1) for v in self.vars}
+        self.states = None   # daily reference states (dict of arrays)
+        self.states_theta = None
+
+        sim, vars_ = self.sim, self.vars
+
+        def per_window(theta, state0, forcing, obsw, scale):
+            out = sim(theta, state0, forcing)
+            total = 0.0
+            for v in vars_:
+                o = obsw[v]
+                pred = sum(out[f] for f in VAR_FIELDS[v])[o["idx"]]
+                total = total + scale[v] * jnp.sum((pred - o["val"]) ** 2 * o["mask"])
+            return total
+
+        def loss(theta, st, F, OBS, scale):
+            return W.run_batched(per_window, theta, (st, F, OBS, scale), n_devices=n_devices, reduce_sum=True)
+
+        self._vg = jax.jit(jax.value_and_grad(loss))
+        self._f = jax.jit(loss)
+
+    def refresh(self, theta, label=""):
+        t0 = time.time()
+        self.states = self.W.reference_states(self.S, theta)
+        self.states_theta = dict(theta) if theta else None
+        print(f"  [windows] start states refreshed from a continuous reference run{label} "
+              f"({time.time() - t0:.0f}s)", flush=True)
+
+    def _batch(self, idx):
+        sub = self.win.iloc[idx]
+        st = self.W.window_start_states(self.states, sub)
+        F = {k: v[idx] for k, v in self.F.items()}
+        OBS = {v: {k: a[idx] for k, a in self.OBS[v].items()} for v in self.vars}
+        # per-window weight weights[v] / (scored values of v in this batch), so
+        # the summed loss is the pooled loss over the batch
+        scale = {v: jnp.full(len(idx), self.weights[v] / max(float(self.counts[v][idx].sum()), 1.0))
+                 for v in self.vars}
+        return st, F, OBS, scale
+
+    def subset(self, k):
+        n = len(self.win)
+        return np.arange(n) if not k or k >= n else np.sort(self.rng.choice(n, size=k, replace=False))
+
+    def value_and_grad(self, theta, idx):
+        return self._vg(theta, *self._batch(idx))
+
+    def value(self, theta, idx):
+        return self._f(theta, *self._batch(idx))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("data_dir", nargs="?", default=".")
@@ -770,6 +899,30 @@ def main():
     parser.add_argument("--params", type=str, default=None,
                          help="comma-separated parameter names to calibrate directly, "
                               "bypassing the sensitivity screen")
+    win = parser.add_argument_group(
+        "windowed calibration (--windows years; needs --params)",
+        "Run the loss on independent yearly windows started from saved states of a continuous "
+        "reference run, in parallel over CPU devices -- see src/windows.py. Final metrics are still "
+        "computed from one continuous run.")
+    win.add_argument("--windows", choices=("none", "years"), default="none")
+    win.add_argument("--window-start", default="02-01", help="MM-DD start of every window (default 02-01)")
+    win.add_argument("--window-steps", type=int, default=8016, help="window length in hours (default 8016 = to 31 Dec)")
+    win.add_argument("--spinup-days", type=int, default=28, help="unscored days at each window start (default 28)")
+    win.add_argument("--window-years", default=None, help="restrict to these years (comma list)")
+    win.add_argument("--test-years", default="",
+                     help="years held out of the loss: comma list, or 'every:N' for every N-th window "
+                          "year; reported as a test loss at the start and end")
+    win.add_argument("--refresh-every", type=int, default=5,
+                     help="refresh the window start states (one continuous forward run) every N iterations "
+                          "(default 5; 0 = never)")
+    win.add_argument("--windows-per-iter", type=int, default=0,
+                     help="random subset of training windows per iteration (0 = all; a multiple of "
+                          "--devices is most efficient)")
+    win.add_argument("--devices", type=int, default=1, help="CPU devices to spread windows over (default 1)")
+    win.add_argument("--single-thread", action="store_true", help="one compute thread per device")
+    win.add_argument("--check-window-gradient", action="store_true",
+                     help="before calibrating, compare the windowed gradient with the continuous-run "
+                          "gradient (cosine similarity, signs); costs one continuous gradient")
     parser.add_argument("--temp-obs", choices=TEMP_OBS_CHOICES, default="all",
                          help="temperature observations from u_ini_file to calibrate against: 'all' "
                               "(default; sparse profiles + high-frequency buoy rows) or 'profiles' "
@@ -911,6 +1064,53 @@ def main():
     # there's no reason to build two wrapper objects for one function.
     grad_fn = jax.jit(jax.value_and_grad(loss_fn))
 
+    wl = None
+    if args.windows == "years":
+        if not args.params:
+            raise SystemExit("--windows years needs --params (the sensitivity screen runs on the "
+                             "continuous record only)")
+        import windows as W
+        W.STATE_KEYS = None
+        s0_full = make_initial_state_full(u0, o2_0, docr_0, docl_0, pocr_0, pocl_0, nx, **ice_state)
+        W.STATE_KEYS = list(s0_full.keys())
+        setup_w = dict(s0=s0_full, forcing={k: np.asarray(v) for k, v in forcing.items()}, geom=geometry,
+                       params=base_params, start=desired_start, n_steps=n_steps, obs=obs)
+        years = [int(y) for y in args.window_years.split(",")] if args.window_years else None
+        allw = W.select_windows(setup_w, args.window_start, args.window_steps, args.spinup_days,
+                                years=years, require_obs=None)
+        keep = []
+        for r in allw.itertuples():
+            keep.append(any(obs_for_loss[v] is not None and np.any(
+                (np.asarray(obs_for_loss[v]["step_idx"]) >= r.i_score) &
+                (np.asarray(obs_for_loss[v]["step_idx"]) < r.i1)) for v in active_vars))
+        allw = allw[keep].reset_index(drop=True)
+        test_years = parse_test_years(args.test_years, allw["year"].tolist())
+        train_w = allw[~allw["year"].isin(test_years)].reset_index(drop=True)
+        test_w = allw[allw["year"].isin(test_years)].reset_index(drop=True)
+        if not len(train_w):
+            raise SystemExit("--windows years: no training windows with observations")
+        D = jax.device_count()
+        print(f"\nWindowed calibration: {len(train_w)} training window(s) {train_w['year'].tolist()}"
+              + (f", {len(test_w)} test window(s) {test_w['year'].tolist()}" if len(test_w) else "")
+              + f"; {args.window_steps} h from {args.window_start}, {args.spinup_days}-day spin-up; "
+                f"{D} device(s){' (single-thread)' if args.single_thread else ''}; "
+                f"start states refreshed every {args.refresh_every or 'never'} iteration(s)")
+        wl = WindowedLoss(W, setup_w, train_w, active_vars, obs_for_loss, weights, args.chunk_steps,
+                          args.window_steps, D)
+        wl_test = (WindowedLoss(W, setup_w, test_w, active_vars, obs_for_loss, weights, args.chunk_steps,
+                                args.window_steps, D) if len(test_w) else None)
+        wl.refresh(None, " at the initial parameters")
+        if wl_test is not None:
+            wl_test.states = wl.states
+        cont_grad_fn = grad_fn
+        all_idx = wl.subset(0)
+
+        def grad_fn(theta):   # noqa: F811 -- windowed replacement, same call signature
+            return wl.value_and_grad(theta, wl.subset(args.windows_per_iter))
+
+        def test_loss(theta):
+            return float(wl_test.value(theta, wl_test.subset(0))) if wl_test is not None else None
+
     if args.params:
         # Bypass the sensitivity screen entirely: its only purpose is to
         # *choose* which parameters to calibrate, which is moot when the
@@ -933,6 +1133,25 @@ def main():
         val0, _ = grad_fn(theta_log0)
         jax.block_until_ready(val0)  # see note below on async dispatch
         print(f"  baseline loss = {float(val0):.6g}  ({time.time() - t0:.1f}s)")
+        if wl is not None:
+            # a subset per iteration makes the baseline a sample; use all windows for the reference
+            if args.windows_per_iter:
+                val0 = wl.value(theta_log0, all_idx)
+                print(f"  baseline loss over all training windows = {float(val0):.6g}")
+            tl0 = test_loss(theta_log0)
+            if tl0 is not None:
+                print(f"  baseline test-window loss = {tl0:.6g}")
+            if args.check_window_gradient:
+                th_sel = {n: theta_log0[n] for n in selected}
+                t0 = time.time()
+                _, gw = wl.value_and_grad(th_sel, all_idx)
+                _, gc = cont_grad_fn(th_sel)
+                a = np.array([float(gw[n]) for n in selected]); b = np.array([float(gc[n]) for n in selected])
+                cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-300))
+                print(f"\n  Gradient check (windowed vs continuous run, {time.time() - t0:.0f}s): cosine similarity "
+                      f"{cos:.3f}; signs agree for {int(np.sum(np.sign(a) == np.sign(b)))}/{len(a)} parameters")
+                for n, x, y in zip(selected, a, b):
+                    print(f"    {n:16s} windowed {x:+.4g}   continuous {y:+.4g}")
     else:
         # --- sensitivity screen ---
         print(f"\nRunning sensitivity screen over {len(candidates)} candidate parameters "
@@ -1045,6 +1264,14 @@ def main():
     stall_count = 0  # consecutive iterations with no "significant" improvement -- see --early-stop-patience
     for it in range(args.iters):
         t0 = time.time()
+        if wl is not None and args.refresh_every and it > 0 and it % args.refresh_every == 0:
+            wl.refresh(theta_log, f" at iteration {it}")
+            if wl_test is not None:
+                wl_test.states = wl.states
+            # losses before and after a refresh aren't comparable (different start
+            # states), so re-score the best parameters with the new states
+            best_loss = float(wl.value(best_theta_log, all_idx))
+            print(f"  [windows] best parameters re-scored with the new states: loss={best_loss:.6g}")
         loss_val, grads = grad_fn(theta_log)
         jax.block_until_ready((loss_val, grads))  # see note above on async dispatch
         non_finite = any(not bool(jnp.all(jnp.isfinite(v))) for v in grads.values()) or not np.isfinite(float(loss_val))
@@ -1087,7 +1314,20 @@ def main():
                     break
 
     print(f"\nBest loss: {best_loss:.6g}  (baseline was {float(val0):.6g}, "
-          f"{100 * (1 - best_loss / float(val0)):.1f}% reduction)")
+          f"{100 * (1 - best_loss / float(val0)):.1f}% reduction)"
+          + ("  -- windowed: compare the same-start-state line below" if wl is not None else ""))
+    if wl is not None:
+        # Losses from before and after start-state refreshes aren't directly
+        # comparable, so score initial and best parameters once more on the same
+        # footing: start states from a reference run with the best parameters.
+        wl.refresh({n: best_theta_log[n] for n in selected}, " at the best parameters")
+        tr0, tr1 = float(wl.value(theta_log0, all_idx)), float(wl.value(best_theta_log, all_idx))
+        print(f"  windowed training loss (same start states): {tr0:.6g} (initial) -> {tr1:.6g} (best), "
+              f"{100 * (1 - tr1 / tr0):.1f}% reduction")
+        if wl_test is not None:
+            wl_test.states = wl.states
+            print(f"  windowed test loss     (same start states): {test_loss(theta_log0):.6g} (initial) -> "
+                  f"{test_loss(best_theta_log):.6g} (best)")
     print("\nCalibrated parameters:")
     print(f"  {'parameter':28s} {'initial':>14s} {'calibrated':>14s} {'change':>10s}")
     results = {}

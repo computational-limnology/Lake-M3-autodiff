@@ -364,9 +364,16 @@ def _consistency_test(a):
     2. all windows batched (vmap, and pmap if --devices > 1): batching changes
        the order of floating-point operations, so results differ at round-off
        level and that difference then grows with the model's own sensitivity;
-    3. control: a single window whose start temperature is perturbed by one
-       part in 1e15 -- the envelope that round-off differences grow into.
-    Batched runs are fine if (2) stays within (3)."""
+    3. control: a single window with a round-off-sized perturbation that acts
+       every step, like batching does (start temperature and the drag
+       coefficient Cd both changed by one part in 1e15). A perturbation of the
+       start state alone is not enough: in a well-mixed or ice-covered winter
+       it is often wiped out within hours, while batching keeps adding
+       round-off differences all window long.
+    The model amplifies round-off in threshold events (mixed-layer deepening,
+    convection, ice), so (2) and (3) are of similar size but differ window by
+    window; batched runs are fine if, over all windows, their differences are
+    no larger than the control's (median and maximum within a factor 2)."""
     t0 = time.time()
     S = build_setup(a.lake_dir, record_end=a.record_end, temp_obs="profiles")
     print(f"setup {time.time() - t0:.0f}s: record {S['start'].date()} + {S['n_steps']} h, "
@@ -387,6 +394,9 @@ def _consistency_test(a):
     st = window_start_states(daily, win)
     sim = make_window_simulator(S["geom"], S["params"], daily_states=True)
     one = jax.jit(lambda s, f: sim(None, s, f)["state"])
+    p_ctl = dict(S["params"]); p_ctl["Cd"] = float(p_ctl["Cd"]) * (1 + 1e-15)
+    sim_ctl = make_window_simulator(S["geom"], p_ctl, daily_states=True)
+    one_ctl = jax.jit(lambda s, f: sim_ctl(None, s, f)["state"])
     t = time.time()
     res_b = run_batched(lambda th, s, f: sim(th, s, f)["state"], None, (st, F))
     jax.block_until_ready(res_b)
@@ -398,9 +408,10 @@ def _consistency_test(a):
         return float(d.max()), first, d
 
     days0 = (win["i0"].to_numpy() // 24).astype(int)
-    ok_single, ok_batched = True, True
+    ok_single = True
+    mbs, mcs = [], []
     print(f"{'window':>6} | {'single: max dT':>14} | {'batched: max dT  first day>1e-10':>34} | "
-          f"{'control (1e-15): max dT  first day':>36}")
+          f"{'control (1e-15 on u0 and Cd): max dT  first day':>48}")
     for b, r in enumerate(win.itertuples()):
         dd = days0[b] + 1 + np.arange(W // 24)
         ref = daily["u"][dd]
@@ -409,7 +420,7 @@ def _consistency_test(a):
         r1 = one(sb, fb)
         m1, f1, _ = udiff(r1["u"], ref)
         sp = dict(sb); sp["u"] = sb["u"] * (1 + 1e-15)
-        rc = one(as_state(sp), fb)
+        rc = one_ctl(as_state(sp), fb)
         mc, fc, dc = udiff(rc["u"], ref)
         mb, fbd, db = udiff(res_b["u"][b], ref)
         rel = {k: float(np.max(np.abs(np.asarray(r1[k], float) - daily[k][dd])
@@ -417,11 +428,15 @@ def _consistency_test(a):
         worst_k = max(rel, key=rel.get)
         others = rel[worst_k]
         ok_single &= (m1 <= 1e-12 and others <= 1e-12)
-        ok_batched &= (mb <= max(3 * mc, 1e-10))
-        print(f"{r.year:>6} | {m1:14.1e} | {mb:16.2e}  {str(fbd):>16} | {mc:22.2e}  {str(fc):>12}"
+        mbs.append(mb); mcs.append(mc)
+        print(f"{r.year:>6} | {m1:14.1e} | {mb:16.2e}  {str(fbd):>16} | {mc:34.2e}  {str(fc):>12}"
               + ("" if others == 0.0 else f"   (other fields: max rel. diff {others:.1e} in {worst_k})"))
     print(f"\nsingle windows {'match the continuous run to round-off (<= 1e-12) (PASS)' if ok_single else 'DO NOT match (FAIL)'}")
-    print(f"batched windows {'stay within the round-off sensitivity envelope (PASS)' if ok_batched else 'exceed 3x the round-off envelope (CHECK)'}")
+    mbs, mcs = np.array(mbs), np.array(mcs)
+    ok_batched = (np.median(mbs) <= 2 * max(np.median(mcs), 1e-10)) and (mbs.max() <= 2 * max(mcs.max(), 1e-10))
+    print(f"batched vs control over {len(mbs)} windows: median max-dT {np.median(mbs):.3g} vs {np.median(mcs):.3g} degC, "
+          f"largest {mbs.max():.3g} vs {mcs.max():.3g} degC")
+    print(f"batched windows {'are within the round-off sensitivity of the model (PASS)' if ok_batched else 'differ more than round-off explains (CHECK)'}")
 
 
 if __name__ == "__main__":
