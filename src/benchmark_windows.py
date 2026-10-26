@@ -42,6 +42,9 @@ def parse():
     ap.add_argument("--window-start", default="02-01", help="MM-DD of each window's start")
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--devices", type=int, default=1, help="CPU devices for --modes pmap")
+    ap.add_argument("--single-thread", action="store_true",
+                    help="one compute thread per device (XLA: no multi-threaded Eigen), so --devices "
+                         "equal to the core count doesn't oversubscribe the CPU")
     ap.add_argument("--out", default=None, help="CSV to append results to")
     return ap.parse_args()
 
@@ -50,6 +53,9 @@ args = parse()
 if args.devices > 1:
     os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "")
                                + f" --xla_force_host_platform_device_count={args.devices}")
+if args.single_thread:
+    os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "")
+                               + " --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1")
 
 from copy import deepcopy  # noqa: E402
 import numpy as np  # noqa: E402
