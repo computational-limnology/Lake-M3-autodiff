@@ -254,6 +254,12 @@ def _early_device_flags(argv):
     if "--single-thread" in argv and "xla_cpu_multi_thread_eigen" not in flags:
         flags += " --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
     os.environ["XLA_FLAGS"] = flags.strip()
+    # With several devices XLA logs "This thread has been waiting for 5000ms ...
+    # may be stuck" / "Thread is unstuck! ... false-positive" whenever one device
+    # finishes a few seconds after the others; these flood the console and hide
+    # the script's own output. They are hidden unless --xla-warnings is given.
+    if "--devices" in argv and "--xla-warnings" not in argv:
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 
 if __name__ == "__main__":
@@ -920,6 +926,9 @@ def main():
                           "--devices is most efficient)")
     win.add_argument("--devices", type=int, default=1, help="CPU devices to spread windows over (default 1)")
     win.add_argument("--single-thread", action="store_true", help="one compute thread per device")
+    win.add_argument("--xla-warnings", action="store_true",
+                     help="show XLA's low-level log messages (with --devices > 1 they are hidden by "
+                          "default, since the multi-device 'may be stuck' warnings flood the console)")
     win.add_argument("--check-window-gradient", action="store_true",
                      help="before calibrating, compare the windowed gradient with the continuous-run "
                           "gradient (cosine similarity, signs); costs one continuous gradient")
@@ -1152,6 +1161,10 @@ def main():
                       f"{cos:.3f}; signs agree for {int(np.sum(np.sign(a) == np.sign(b)))}/{len(a)} parameters")
                 for n, x, y in zip(selected, a, b):
                     print(f"    {n:16s} windowed {x:+.4g}   continuous {y:+.4g}")
+                gc_path = os.path.join(os.getcwd(), "calibration_gradient_check.csv")
+                pd.DataFrame({"parameter": selected, "grad_windowed": a, "grad_continuous": b}).assign(
+                    cosine_similarity=cos).to_csv(gc_path, index=False)
+                print(f"  (saved to {gc_path})")
     else:
         # --- sensitivity screen ---
         print(f"\nRunning sensitivity screen over {len(candidates)} candidate parameters "
