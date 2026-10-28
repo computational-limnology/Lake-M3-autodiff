@@ -1159,10 +1159,16 @@ def main():
                 cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-300))
                 print(f"\n  Gradient check (windowed vs continuous run, {time.time() - t0:.0f}s): cosine similarity "
                       f"{cos:.3f}; signs agree for {int(np.sum(np.sign(a) == np.sign(b)))}/{len(a)} parameters")
-                for n, x, y in zip(selected, a, b):
-                    print(f"    {n:16s} windowed {x:+.4g}   continuous {y:+.4g}")
+                # The cosine is dominated by the largest gradient component, so
+                # also report each parameter's ratio; Adam's steps depend on each
+                # component separately (roughly its sign early on).
+                ratio = np.where(np.abs(b) > 0, a / np.where(b == 0, 1.0, b), np.nan)
+                for n, x, y, r in zip(selected, a, b, ratio):
+                    flag = "" if np.sign(x) == np.sign(y) and 0.5 <= r <= 2.0 else "   <-- differs"
+                    print(f"    {n:16s} windowed {x:+.4g}   continuous {y:+.4g}   ratio {r:.2f}{flag}")
                 gc_path = os.path.join(os.getcwd(), "calibration_gradient_check.csv")
-                pd.DataFrame({"parameter": selected, "grad_windowed": a, "grad_continuous": b}).assign(
+                pd.DataFrame({"parameter": selected, "grad_windowed": a, "grad_continuous": b,
+                              "ratio_windowed_to_continuous": ratio}).assign(
                     cosine_similarity=cos).to_csv(gc_path, index=False)
                 print(f"  (saved to {gc_path})")
     else:
