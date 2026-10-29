@@ -542,6 +542,47 @@ DIFFUSION_METHODS = ("hendersonSellers", "richardson", "richardson_seiche")
 
 _SEICHE_E_EPS = 1.0       # J -- keeps sqrt(E) differentiable at E = 0
 _OSBORN_N2_FLOOR = 1e-7   # s^-2 -- floor on N2 in K = Gamma*eps/N2 (well-mixed water)
+# Gradient-only constants (forward values are unaffected):
+_OSBORN_GRAD_N2 = 1e-5    # s^-2 -- dK/dN2 is evaluated as -K/max(N2, this)  (fix A1)
+_KCAP_GRAD_WIDTH = 0.1    # relative width of the soft derivative of min(K, k_max)  (fix A2)
+
+
+# Fix A1 (2026-10-29). K = Gamma*eps/N2 has dK/dN2 = -K/N2, which becomes huge
+# when N2 is tiny but above the floor -- typically in spring near 4 degC, when
+# density barely depends on temperature. Within one step the loop temperature
+# -> N2 -> K -> diffusion -> temperature then has a gain >> 1; repeated over
+# hours, backpropagated gradients exploded (Ravn, effective wind 1.2x: up to
+# 1e4 in spring 2007; located with per-window/per-chunk gradient scans).
+# Forward value unchanged; the N2-derivative uses max(N2, _OSBORN_GRAD_N2).
+@jax.custom_jvp
+def _osborn_div(num, n2):
+    return num / jnp.maximum(n2, _OSBORN_N2_FLOOR)
+
+
+@_osborn_div.defjvp
+def _osborn_div_jvp(primals, tangents):
+    num, n2 = primals
+    d_num, d_n2 = tangents
+    n2f = jnp.maximum(n2, _OSBORN_N2_FLOOR)
+    k = num / n2f
+    dk_dn2 = jnp.where(n2 > _OSBORN_N2_FLOOR, -k / jnp.maximum(n2, _OSBORN_GRAD_N2), 0.0)
+    return k, d_num / n2f + dk_dn2 * d_n2
+
+
+# Fix A2 (2026-10-29). Forward is exactly min(k, cap); the derivative is that
+# of a soft minimum (sigmoid blend over a relative width), so it doesn't
+# switch abruptly from 1 to 0 when K reaches k_max.
+@jax.custom_jvp
+def _capped(k, cap):
+    return jnp.minimum(k, cap)
+
+
+@_capped.defjvp
+def _capped_jvp(primals, tangents):
+    k, cap = primals
+    dk, dcap = tangents
+    w = jax.nn.sigmoid((cap - k) / (_KCAP_GRAD_WIDTH * cap))
+    return jnp.minimum(k, cap), w * dk + (1.0 - w) * dcap
 
 
 def seiche_energy_step(E, Uw_eff, area, volume, dt, ice, seiche_alpha, c10, cd_bottom,
@@ -604,8 +645,10 @@ def seiche_interior_diffusivity(loss, N2, area, dx, cd_bottom, mixing_efficiency
     so the division stays finite."""
     useful = jnp.maximum(1.0 - 10.0 * jnp.sqrt(cd_bottom), 0.0)
     eps = sediment_area_per_volume(area, dx) * loss * useful / (area[0] * rho_0)
-    K = mixing_efficiency * eps / jnp.maximum(N2, _OSBORN_N2_FLOOR)
-    return jnp.minimum(K, k_max)
+    # bounded-derivative division and cap: forward identical to
+    # min(Gamma*eps/max(N2, floor), k_max); see fixes A1/A2 above
+    K = _osborn_div(mixing_efficiency * eps, N2)
+    return _capped(K, k_max)
 
 
 def surface_layer_weight(rho, sbl_drho, sbl_width):
@@ -1154,6 +1197,46 @@ def diffusion_step_wq(u, o2, docr, docl, kz, area, dx, dt):
 # ---------------------------------------------------------------------------
 
 
+_KP_GRAD_DD = 1e-3   # kg m-3 -- dKP/d(dD) evaluated as -KP/max(|dD|, this)  (fix B1)
+
+
+# Fix B1 (2026-10-29). In mixing_step the partial-entrainment fraction
+# KP = KE / POE, POE = dD * rest, has dKP/d(dD) = -KP/dD: when the density step
+# at the mixed-layer base is tiny (near 4 degC, or a cooler surface layer at
+# night) the derivative of the mixing output w.r.t. temperature reached
+# ~100-200 per step, where a mixing (averaging) operation should stay ~1.
+# Forward value unchanged (including the POE == 0 guard of the reference);
+# the dD-derivative uses max(|dD|, _KP_GRAD_DD).
+@jax.custom_jvp
+def _kp_ratio(ke, dd, g, vw, lever):
+    # POE = dD * g * V_weight * lever, multiplied in the reference's order so
+    # the forward value is bit-identical to the original KE / POE
+    poe = dd * g * vw * lever
+    return ke / jnp.where(poe != 0, poe, 1.0)
+
+
+@_kp_ratio.defjvp
+def _kp_ratio_jvp(primals, tangents):
+    ke, dd, g, vw, lever = primals
+    d_ke, d_dd, d_g, d_vw, d_lever = tangents
+    poe = dd * g * vw * lever
+    nz = poe != 0
+    safe = jnp.where(nz, poe, 1.0)
+    kp = ke / safe
+
+    def rel(x):  # -kp/x, guarded
+        return jnp.where(nz & (x != 0), -kp / jnp.where(x != 0, x, 1.0), 0.0)
+
+    # KE carries the energy left after the layers above were mixed in
+    # (KE0 - sum of their POE), so dKP/dKE = 1/POE is just as large as
+    # dKP/d(dD) when dD is tiny; both use the bounded density step.
+    dd_g = jnp.maximum(jnp.abs(dd), _KP_GRAD_DD)
+    poe_g = dd_g * g * vw * lever
+    dkp_dke = jnp.where(nz, 1.0 / jnp.where(poe_g != 0, poe_g, 1.0), 1.0)
+    dkp_ddd = jnp.where(nz, -kp * jnp.sign(dd) / dd_g, 0.0)
+    return kp, dkp_dke * d_ke + dkp_ddd * d_dd + rel(g) * d_g + rel(vw) * d_vw + rel(lever) * d_lever
+
+
 def mixing_step(u, depth, area, volume, dx, dt, Uw, ice, g=9.81, Cd=0.0013, W_str=None, tracers=()):
     """Wind-mixing search from `mixing_module_minlake_RL`. `tracers` is an
     optional tuple of extra state arrays *already expressed as
@@ -1206,12 +1289,17 @@ def mixing_step(u, depth, area, volume, dx, dt, Uw, ice, g=9.81, Cd=0.0013, W_st
         dD = d_rho[zb]
         Zg_num = jnp.sum(jnp.where(mask_le_zb, area * depth * rho * dx, 0.0))
         Zg_den = jnp.sum(jnp.where(mask_le_zb, area * rho * dx, 0.0))
-        Zg = jnp.ceil((Zg_num / Zg_den) * 100) / 100
+        # Fix B2 (2026-10-29): the reference rounds Zg up to whole cm
+        # (ceil(Zg*100)/100) -- a step function in the state with zero
+        # derivative that shifts POE by up to ~2 %; removed.
+        Zg = Zg_num / Zg_den
         volume_epi = jnp.sum(jnp.where(mask_le_zb, volume, 0.0))
         vol_zb1 = volume[zb + 1]
         V_weight = vol_zb1 * volume_epi / (vol_zb1 + volume_epi)
-        POE = dD * g * V_weight * (MLD + dx / 2 - Zg)
-        KP_ratio = KE / jnp.where(POE != 0, POE, 1.0)
+        lever = MLD + dx / 2 - Zg
+        POE = dD * g * V_weight * lever
+        # Fix B1: KE / POE with a bounded derivative w.r.t. the density step dD
+        KP_ratio = _kp_ratio(KE, dD, g, V_weight, lever)
 
         branch_gt1 = KP_ratio > 1
         denom2 = jnp.sum(jnp.where(mask_le_zb, volume, 0.0)) + KP_ratio * vol_zb1

@@ -1,0 +1,105 @@
+PB: Ravn/res_lake1_jax_full.npz  (13149 days from 1989-01-01)
+MCL: Ravn/res_lake1_mcl_hybrid.npz  (13149 days from 1989-01-01)
+Observations: profiles, 608 profile dates, 13100 values; model sampled as daily_mean
+
+==============================================================================
+A  Volume-weighted error split (profiles with full-column coverage)
+  PB:
+    all        n= 567  RMSE_V=2.44  mean heat-content bias=-0.00  heat-content share=18%
+    DJF        n=  79  RMSE_V=1.21  mean heat-content bias=-1.12  heat-content share=98%
+    JJA        n= 191  RMSE_V=3.12  mean heat-content bias=+0.75  heat-content share=11%
+    MAM        n= 160  RMSE_V=1.49  mean heat-content bias=-0.80  heat-content share=45%
+    SON        n= 137  RMSE_V=2.77  mean heat-content bias=+0.53  heat-content share=11%
+    1989-1999  n= 192  RMSE_V=1.98  mean heat-content bias=-0.19  heat-content share=16%
+    2000-2009  n= 198  RMSE_V=2.65  mean heat-content bias=+0.19  heat-content share=19%
+    2010-2024  n= 177  RMSE_V=2.65  mean heat-content bias=-0.01  heat-content share=17%
+  MCL:
+    all        n= 567  RMSE_V=2.42  mean heat-content bias=+0.00  heat-content share=18%
+    DJF        n=  79  RMSE_V=1.21  mean heat-content bias=-1.12  heat-content share=98%
+    JJA        n= 191  RMSE_V=3.07  mean heat-content bias=+0.75  heat-content share=11%
+    MAM        n= 160  RMSE_V=1.49  mean heat-content bias=-0.80  heat-content share=45%
+    SON        n= 137  RMSE_V=2.76  mean heat-content bias=+0.55  heat-content share=12%
+    1989-1999  n= 192  RMSE_V=1.96  mean heat-content bias=-0.19  heat-content share=16%
+    2000-2009  n= 198  RMSE_V=2.62  mean heat-content bias=+0.20  heat-content share=20%
+    2010-2024  n= 177  RMSE_V=2.61  mean heat-content bias=-0.01  heat-content share=17%
+
+B  Bias / RMSE by layer and season (all periods)
+  PB  bias:
+season   DJF   MAM   JJA   SON
+    layer                         
+    epi    -1.31 -1.70 -2.05 -1.27
+    meta   -1.24 -0.54  1.74  0.34
+    hypo   -1.14 -0.16  2.01  2.83
+  PB  rmse:
+season   DJF   MAM   JJA   SON
+    layer                         
+    epi     1.43  2.02  2.24  1.41
+    meta    1.30  1.51  3.55  2.69
+    hypo    1.24  1.25  3.12  3.91
+  MCL  bias:
+season   DJF   MAM   JJA   SON
+    layer                         
+    epi    -1.31 -1.70 -2.06 -1.28
+    meta   -1.23 -0.54  1.71  0.33
+    hypo   -1.14 -0.17  2.07  2.91
+  MCL  rmse:
+season   DJF   MAM   JJA   SON
+    layer                         
+    epi     1.43  2.02  2.25  1.41
+    meta    1.29  1.50  3.51  2.68
+    hypo    1.24  1.27  3.06  3.92
+
+C  Stratification
+  PB: onset error +2.9 d (|.| 9.4 d, inside interval 45% of 31 yrs); end error -18.5 d (|.| 18.5 d, inside 20% of 30 yrs)
+       hypolimnion bias at onset -0.18, Jun-Sep +2.29 degC; corr(onset, summer) = 0.30 over 31 yrs
+       Jun-Sep: surface-bottom dT bias -3.39 degC, thermocline depth bias +6.17 m, Schmidt ratio model/obs 0.58
+       Jan-Feb inverse stratification (top colder by >0.5): obs 16%, model 22% of 51 profiles; agree 86%
+  MCL: onset error +3.8 d (|.| 9.3 d, inside interval 48% of 31 yrs); end error -20.4 d (|.| 20.4 d, inside 20% of 30 yrs)
+       hypolimnion bias at onset -0.17, Jun-Sep +2.37 degC; corr(onset, summer) = 0.28 over 31 yrs
+       Jun-Sep: surface-bottom dT bias -3.49 degC, thermocline depth bias +5.34 m, Schmidt ratio model/obs 0.59
+       Jan-Feb inverse stratification (top colder by >0.5): obs 16%, model 22% of 51 profiles; agree 86%
+
+D  Drift (degC/decade +- SE) and best single step change
+  PB       resid_epi          trend -0.182 +- 0.041   step 2001 (t=3.6, -0.286)  <-- 
+  PB       resid_meta         trend +0.315 +- 0.108   step 1999 (t=4.6, +0.849)  <-- 
+  PB       resid_hypo         trend -0.142 +- 0.171   step 2012 (t=3.1, -0.911)
+  PB       bias_heat_content  trend +0.042 +- 0.065   step 2000 (t=2.7, +0.280)
+  MCL      resid_epi          trend -0.181 +- 0.040   step 2001 (t=3.6, -0.285)  <-- 
+  MCL      resid_meta         trend +0.316 +- 0.107   step 1999 (t=4.8, +0.857)  <-- 
+  MCL      resid_hypo         trend -0.133 +- 0.171   step 2012 (t=3.1, -0.906)
+  MCL      bias_heat_content  trend +0.044 +- 0.066   step 2000 (t=2.7, +0.287)
+  forcing  Tair               trend +0.140 +- 0.105   step 2014 (t=2.6, +0.498)
+  forcing  RH                 trend +0.392 +- 0.164   step 1998 (t=5.1, +1.364)  <-- 
+  forcing  Wind               trend -0.098 +- 0.027   step 2018 (t=5.4, -0.297)  <-- 
+  forcing  SW                 trend -0.564 +- 0.692   step 1993 (t=1.8, -2.225)
+  forcing  LW                 trend +1.076 +- 0.599   step 2014 (t=2.8, +3.176)
+  forcing  Precip             trend +0.008 +- 0.002   step 1998 (t=4.4, +0.017)  <-- 
+
+E  Strongest weather links (|Spearman| >= 0.3)
+run season layer  driver   n  spearman
+MCL    SON   epi Tair_7d 141 -0.721307
+ PB    SON   epi Tair_7d 141 -0.715356
+MCL    SON   epi   SW_7d 141 -0.685085
+ PB    SON   epi   SW_7d 141 -0.680491
+ PB    MAM  hypo Tair_7d 164  0.649858
+MCL    MAM  hypo Tair_7d 164  0.646234
+MCL    MAM  hypo   SW_7d 164  0.597532
+ PB    MAM  hypo   SW_7d 164  0.594521
+MCL    SON  meta   SW_7d 140  0.565704
+ PB    SON  meta   SW_7d 140  0.564147
+MCL    SON  meta Tair_7d 140  0.557456
+ PB    SON  meta Tair_7d 140  0.556507
+MCL    SON  hypo Tair_7d 139  0.533992
+ PB    SON  hypo Tair_7d 139  0.511904
+MCL    MAM  meta Tair_7d 165  0.507712
+
+F  Observation checks
+  PB: 0 outlying profiles (robust z>3): 
+  MCL: 0 outlying profiles (robust z>3): 
+  model time of day vs date-only profiles (bias epi JJA): PB daily_mean -2.05, PB 00:00 -2.07, PB 12:00 -2.02, MCL daily_mean -2.06, MCL 00:00 -2.07, MCL 12:00 -2.03
+
+Decision rules
+  PB: vertical distribution dominates (b^2 share < 40%) [18%]; significant drift or step change in residuals -> check forcing record
+  MCL: vertical distribution dominates (b^2 share < 40%) [18%]; significant drift or step change in residuals -> check forcing record
+
+Tables and figures written to /sessions/festive-vibrant-feynman/mnt/Lake-M3-autodiff/Ravn/diagnostics

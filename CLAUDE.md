@@ -131,7 +131,18 @@ then the usual continuous-run metrics. Needs `--params`.
    result depends on start point.
 6. Forcing record: step changes RH 1998, precip 1998, wind 2018; metalimnion
    residual step ~2000 -> check weather-station history.
-7. kd model has no skill (NSE ~ -0.07); Ravn DOC NSE NaN in plot_output
+7. Run 4 (wind_factor 1 with lake_config WindSpeed 1.2, mixing-only params
+   W_str, seiche_alpha, k_max, sbl_drho): badly over-mixed (NSE 0.42) and
+   gradients exploded (1e9-1e15, cosine -0.20). Effective wind ~0.76x measured
+   (sheltering) fits Ravn; run 3 stays the best set.
+8. Gradient explosion located (2026-10-29): spring near 4 degC, loop
+   temperature -> N2 -> Osborn K = Gamma*eps/N2 -> diffusion (dK/dN2 = -K/N2),
+   amplified by mixing_step's KP = KE/POE (POE ~ tiny density step). Fixed with
+   bounded custom derivatives (A1 `_osborn_div`, A2 `_capped`, B1 `_kp_ratio`;
+   forward bit-identical) and removal of the Zg cm-rounding (B2; changes
+   forward by ~0.06 degC RMS, within the round-off noise floor).
+   Ravn lake_config WindSpeed is now 1 (was 1.2); wind_factor 0.759 = run 3.
+9. kd model has no skill (NSE ~ -0.07); Ravn DOC NSE NaN in plot_output
    (constant obs?) — open.
 
 ## Agreed next steps
