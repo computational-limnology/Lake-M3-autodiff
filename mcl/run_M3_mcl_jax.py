@@ -192,7 +192,9 @@ def main():
     run_config = get_run_config("./run_config.csv", lake_num)
     ice_and_snow = get_ice_and_snow("./ice_and_snow.csv", lake_num)
 
-    windfactor = float(lake_config["WindSpeed"])
+    # wind: only model_params.csv wind_factor scales wind (applied in full_step / run_wq_model);
+    # lake_config.csv no longer has a WindSpeed multiplier.
+    windfactor = 1.0  # meteo wind used unscaled by provide_meteorology()
     nx = int(run_config["nx"]); dt = float(run_config["dt"]); dx = float(run_config["dx"])
     area, depth, volume, hypso_weight = get_hypsography(
         hypsofile=run_config["hypso_ini_file"], dx=dx, nx=nx, outflow_depth=float(lake_config["outflow_depth"]),
@@ -224,7 +226,7 @@ def main():
     carbon_data = provide_carbon(ocloadfile=run_config["oc_load_file"], startingDate=desired_start, startTime=1)
     carbon_data = carbon_data.dropna(subset=["oc"])
 
-    forcing = build_forcing_series(meteo_all, step_times, windfactor)
+    forcing = build_forcing_series(meteo_all, step_times)
     forcing = add_wq_forcing_series(forcing, tp_boundary, carbon_data, step_times)
 
     mean_depth = float(np.sum(volume) / np.max(area))

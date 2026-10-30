@@ -744,8 +744,25 @@ def _plot_layer_bias_map(temp, time_values, depth_values, observations, start_ti
     return fig
 
 
+def _time_block_mean(arr, max_cols):
+    """Average a (time, depth) array over consecutive blocks of k time steps,
+    k = ceil(n_time / max_cols), so at most `max_cols` columns remain (the
+    last block may be shorter). Returns (reduced array, k); k = 1 returns the
+    input unchanged."""
+    arr = np.asarray(arr)
+    n = arr.shape[0]
+    if max_cols is None or max_cols <= 0 or n <= max_cols:
+        return arr, 1
+    k = int(np.ceil(n / max_cols))
+    n_full = (n // k) * k
+    parts = [arr[:n_full].reshape(n_full // k, k, arr.shape[1]).mean(axis=1, dtype=np.float64)]
+    if n_full < n:
+        parts.append(arr[n_full:].mean(axis=0, dtype=np.float64)[None, :])
+    return np.concatenate(parts, axis=0), k
+
+
 def plot_result(path, observations_path=None, water_quality_observations_path=None, depths=None,
-                 series=None, bias_map_obs="profiles"):
+                 series=None, bias_map_obs="profiles", max_heatmap_cols=4000):
     res = load_result(path)
     if not isinstance(res, dict):
         raise TypeError(f"Expected a dictionary-like result, got {type(res).__name__}")
@@ -776,6 +793,13 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
     volume = to_numpy(res["volume"]) if "volume" in res else _load_model_volume(path, n_depth)
 
     arrays = _prepare_plot_arrays(res, time_values, depth_values, n_depth, volume, series=series)
+    # The raw (mass) fields are no longer needed once converted: `arrays`
+    # holds the concentration copies (and speed replaces uvel/vvel). Dropping
+    # them frees ~1.1 GB for a full Ravn run. `temp`/kd_light stay.
+    for name in ("o2", "docr", "docl", "pocr", "pocl", "uvel", "vvel"):
+        key = _resolve_series_key(res, name, series)
+        if key is not None:
+            res.pop(key, None)
 
     x_ticks, x_labels = _build_time_labels(time_values, start_time)
     y_values = depth_values if depth_values is not None and depth_values.ndim == 1 and depth_values.size == n_depth else None
@@ -798,15 +822,22 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
             axes[i].axis("off")
             continue
 
-        mesh = axes[i].pcolormesh(
-            np.arange(n_time + 1),
-            -np.arange(n_depth + 1),
-            data.T,
+        # Block-mean in time + imshow (not pcolormesh on every hour): a full
+        # 1989-2024 hourly run is 315k x 64 cells per field, and pcolormesh
+        # keeps ~65 bytes/cell (~1.3 GB per panel, ~9 GB for 7 panels), which
+        # crashed the script. The extent keeps the axis in time-step units,
+        # so the date ticks below are unchanged.
+        reduced, block = _time_block_mean(data, max_heatmap_cols)
+        mesh = axes[i].imshow(
+            reduced.T,
             cmap=plt.colormaps.get_cmap("Spectral_r"),
-            shading="auto",
+            aspect="auto",
+            interpolation="nearest",
+            extent=(0, n_time, -n_depth, 0),
+            origin="upper",
         )
         fig.colorbar(mesh, ax=axes[i], label=cbar_label)
-        axes[i].set_title(title)
+        axes[i].set_title(title if block == 1 else f"{title} ({block}-step means)")
         axes[i].set_xlabel("Time step")
         axes[i].set_ylabel("Depth level")
 
@@ -963,6 +994,14 @@ def main():
         "<result>_bias_map.png): 'profiles' (default; only high_frequency == 0 rows, i.e. "
         "without the buoy record), 'all', or 'none' to skip it.",
     )
+    parser.add_argument(
+        "--heatmap-max-cols",
+        type=int,
+        default=4000,
+        help="Maximum number of time columns in the depth-time heatmaps; longer runs are "
+        "block-averaged in time (default 4000, i.e. ~3.3-day means for 1989-2024 hourly). "
+        "0 = no averaging (needs ~1.3 GB RAM per panel for a 36-year hourly run).",
+    )
     args = parser.parse_args()
 
     depths = None
@@ -978,6 +1017,7 @@ def main():
     plot_result(
         args.path, args.observations, args.water_quality_observations, depths=depths,
         series=args.series, bias_map_obs=args.bias_map_obs,
+        max_heatmap_cols=args.heatmap_max_cols,
     )
 
 

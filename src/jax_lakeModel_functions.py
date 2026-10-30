@@ -2286,19 +2286,12 @@ def default_params(model_params: dict, ice_and_snow: dict = None,
         sw_factor=float(model_params["sw_factor"]),
         at_factor=float(model_params["at_factor"]),
         turb_factor=float(model_params["turb_factor"]),
-        # NOTE: the reference `run_wq_model` applies this as a second wind
-        # multiplier *on top of* lake_config.csv's own "WindSpeed" (already
-        # baked into `forcing["Uw"]` when it's built -- see
-        # `build_forcing_series()`/`provide_meteorology()`): run_M3.py passes
-        # `wind_factor=model_params["wind_factor"]` into run_wq_model, which
-        # rebuilds its own Uw series as `wind_factor * daily_meteo.wind`
-        # (itself already scaled by lake_config's WindSpeed upstream). Ported
-        # here the same way sw_factor/at_factor/turb_factor are -- applied to
-        # the forcing value inside `temperature_step`/`full_step`, not baked
-        # into the forcing series -- so it stays a plain entry of `params`
-        # and is differentiable/calibratable like any other CANDIDATE_PARAMS
-        # entry (unlike lake_config's WindSpeed, which is fixed at forcing-
-        # construction time and not part of `params` at all).
+        # The only wind multiplier: applied to forcing["Uw"] (unscaled meteo
+        # wind, see run_M3_jax.build_forcing_series) inside full_step /
+        # temperature_step, like sw_factor/at_factor/turb_factor, so it stays a
+        # plain differentiable/calibratable `params` entry. lake_config.csv no
+        # longer has a WindSpeed multiplier (removed 2026-10-29; it used to be
+        # applied twice in the JAX forcing).
         wind_factor=float(model_params["wind_factor"]),
         Hgeo=float(model_params["Hgeo"]),
         dt_iceon_avg=float(ice_and_snow.get("dt_iceon_avg", 0.8)),

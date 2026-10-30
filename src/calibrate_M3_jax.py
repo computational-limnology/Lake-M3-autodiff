@@ -225,6 +225,27 @@ Example (14 cores):
         --params sw_factor,wind_factor,k_max,seiche_alpha --windows years \
         --devices 14 --single-thread --test-years every:4 --check-window-gradient
 
+Levenberg-Marquardt (`--optimizer lm`, needs `--windows years` and
+`--params`; all training windows every iteration): the windowed loss is
+written as a sum of squared residuals r = sqrt(weight_v / N_v) * (model -
+obs) (sum r^2 = the Adam loss), the Jacobian dr/d log(p) is computed per
+window by forward-mode AD (jax.jacfwd, one tangent per parameter, no memory
+cost for long windows; untruncated by default, `--lm-jacobian-chunk N` to
+truncate) in parallel over the devices, and damped Gauss-Newton steps are
+taken within the same log-space bounds as Adam (src/lm_optimizer.py: Nielsen
+damping update, `--lm-max-step` cap, `--lm-max-trials` rejected steps before
+stopping). Test windows (`--test-years`) are scored every iteration as
+validation only. Start states are refreshed every `--refresh-every` accepted
+steps (1-2 recommended: LM steps are large). At the end, start states are
+refreshed at the result and the parameter covariance s^2 (J^T J)^-1 is
+reported (relative SE, conservative SE counting one value per profile date,
+95% range, correlations, condition number) and saved to
+calibration_lm_covariance.csv; iterations to calibration_lm_history.csv.
+Example (14 cores):
+    python src/calibrate_M3_jax.py Ravn --variables temp --temp-obs profiles \
+        --params wind_factor,k_max,seiche_alpha,sbl_drho --windows years \
+        --devices 14 --single-thread --test-years every:4 --optimizer lm --iters 10 --refresh-every 1
+
 Evaluation: after optimization, the model is run once more at the initial
 and at the calibrated parameters, and RMSE, NSE (Nash-Sutcliffe
 efficiency), KGE (Kling-Gupta efficiency), and R^2 (squared Pearson
@@ -828,6 +849,47 @@ class WindowedLoss:
 
         self._vg = jax.jit(jax.value_and_grad(loss))
         self._f = jax.jit(loss)
+        self.n_dates = {v: W.window_obs(obs[v], self.win)["valid"].sum(axis=1) for v in self.vars}
+        self._ne_cache = {}
+        self.chunk_steps = chunk_steps
+
+    def normal_equations(self, theta, idx, names, jac_chunk=0):
+        """Levenberg-Marquardt pieces over the windows `idx`: residuals
+        r = sqrt(scale_v) * (model - obs) (so sum r^2 = this class's loss),
+        Jacobian J = dr/d theta by forward-mode AD (jacfwd: one tangent per
+        parameter), computed per window in parallel; returns numpy
+        (A = J^T J, g = J^T r, L = r^T r, per-window dict(L, g)).
+        jac_chunk = truncation of the Jacobian in steps (0 = whole window, i.e.
+        no truncation -- forward mode needs no memory for it)."""
+        key = (tuple(names), int(jac_chunk))
+        if key not in self._ne_cache:
+            W, vars_ = self.W, self.vars
+            chunk = self.window_steps if not jac_chunk else jac_chunk
+            fields = tuple(dict.fromkeys(f for v in vars_ for f in VAR_FIELDS[v]))
+            sim = W.make_window_simulator(self.S["geom"], self.S["params"], chunk_steps=chunk, outputs=fields)
+            names_ = list(names)
+
+            def per_window(theta, state0, forcing, obsw, scale):
+                def resid(th):
+                    out = sim(th, state0, forcing)
+                    rs = []
+                    for v in vars_:
+                        o = obsw[v]
+                        pred = sum(out[f] for f in VAR_FIELDS[v])[o["idx"]]
+                        rs.append((jnp.sqrt(scale[v]) * (pred - o["val"]) * o["mask"]).reshape(-1))
+                    return jnp.concatenate(rs)
+                r = resid(theta)
+                Jd = jax.jacfwd(resid)(theta)
+                J = jnp.stack([Jd[n] for n in names_], axis=1)   # (R, P)
+                return J.T @ J, J.T @ r, r @ r
+
+            def ne(theta, st, F, OBS, scale):
+                return W.run_batched(per_window, theta, (st, F, OBS, scale), n_devices=self.n_devices)
+
+            self._ne_cache[key] = jax.jit(ne)
+        A, g, L = self._ne_cache[key](theta, *self._batch(idx))
+        A, g, L = np.asarray(A), np.asarray(g), np.asarray(L)
+        return A.sum(axis=0), g.sum(axis=0), float(L.sum()), dict(L=L, g=g)
 
     def refresh(self, theta, label=""):
         t0 = time.time()
@@ -856,6 +918,79 @@ class WindowedLoss:
 
     def value(self, theta, idx):
         return self._f(theta, *self._batch(idx))
+
+
+def run_lm(args, wl, wl_test, all_idx, selected, theta_log0, log_lo, log_hi):
+    """Levenberg-Marquardt on the windowed loss (src/lm_optimizer.py), in
+    log-parameters within the same bounds as Adam. The held-out test windows
+    are scored every iteration for validation (not used for decisions). At the
+    end the start states are refreshed at the result and the parameter
+    covariance is computed from J^T J there (saved to
+    calibration_lm_covariance.csv / calibration_lm_history.csv)."""
+    from lm_optimizer import lm_minimize, covariance_report
+    names = list(selected)
+    to_theta = lambda x: {n: jnp.asarray(float(x[i])) for i, n in enumerate(names)}
+    x0 = np.array([float(theta_log0[n]) for n in names])
+    lo = np.array([float(log_lo[n]) for n in names]); hi = np.array([float(log_hi[n]) for n in names])
+    jc = args.lm_jacobian_chunk
+
+    def normal_eq(x):
+        t0 = time.time()
+        A, g, L, _ = wl.normal_equations(to_theta(x), all_idx, names, jac_chunk=jc)
+        print(f"     (Jacobian over {len(all_idx)} windows: {time.time() - t0:.0f}s)", flush=True)
+        return A, g, L
+
+    def loss(x):
+        return float(wl.value(to_theta(x), all_idx))
+
+    def refresh(x):
+        wl.refresh(to_theta(x), " (LM)")
+        if wl_test is not None:
+            wl_test.states = wl.states
+
+    def validate(x):
+        return float(wl_test.value(to_theta(x), wl_test.subset(0))) if wl_test is not None else None
+
+    print(f"\nRunning Levenberg-Marquardt (up to {args.iters} iterations; Jacobian by forward-mode AD, "
+          f"{'whole window' if not jc else f'truncated every {jc} steps'}; lambda0={args.lm_lambda0:g}, "
+          f"max step {args.lm_max_step:g} log units; start states refreshed every "
+          f"{args.refresh_every or 'never'} accepted step(s); "
+          f"{'test windows reported as validation' if wl_test is not None else 'no test windows'})...",
+          flush=True)
+    out = lm_minimize(normal_eq, loss, x0, lo, hi, names=names, max_iters=args.iters,
+                      lam0=args.lm_lambda0, max_trials=args.lm_max_trials, max_step=args.lm_max_step,
+                      ftol=args.early_stop_tol, xtol=args.lm_xtol, refresh=refresh,
+                      refresh_every=args.refresh_every, validate=validate,
+                      log=lambda m: print(m, flush=True))
+    print(f"  LM stopped: {out['reason']}")
+    x = out["x"]
+    hist_path = os.path.join(os.getcwd(), "calibration_lm_history.csv")
+    out["history"].to_csv(hist_path, index=False)
+
+    # uncertainty at the result, with start states from a run at the result
+    refresh(x)
+    A, g, L, _ = wl.normal_equations(to_theta(x), all_idx, names, jac_chunk=jc)
+    n = int(sum(float(np.asarray(wl.counts[v])[all_idx].sum()) for v in wl.vars))
+    n_eff = int(sum(float(np.asarray(wl.n_dates[v])[all_idx].sum()) for v in wl.vars))
+    tab, corr, info = covariance_report(x, A, L, n, n_eff, names)
+    print(f"\nParameter uncertainty at the result (from J^T J; n = {n} scored values, "
+          f"{n_eff} profile dates; condition number {info['cond']:.3g}):")
+    print("  rel. SE = standard error of log(p) ~ relative error; 'conservative' counts each profile "
+          "date as one independent value (residuals within a profile are correlated)")
+    print(f"  {'parameter':16s} {'value':>11s} {'rel.SE':>8s} {'rel.SE cons.':>12s} "
+          f"{'95% range (conservative)':>28s}")
+    for r in tab.itertuples():
+        flag = "" if r.identifiable else "   <-- not identifiable (conservative SE > 100%)"
+        print(f"  {r.parameter:16s} {r.value:11.4g} {r.rel_se:8.2%} {r.rel_se_conservative:12.2%} "
+              f"   [{r.lo95_conservative:.4g}, {r.hi95_conservative:.4g}]{flag}")
+    print("  correlation matrix:")
+    print("    " + corr.round(2).to_string().replace("\n", "\n    "))
+    print(f"  gradient at the result: " + " ".join(f"{nm}:{2 * gi:+.3g}" for nm, gi in zip(names, g)))
+    cov_path = os.path.join(os.getcwd(), "calibration_lm_covariance.csv")
+    tab.join(corr.add_prefix("corr_"), on="parameter").assign(
+        n=info["n"], n_eff=info["n_eff"], cond=info["cond"]).to_csv(cov_path, index=False)
+    print(f"  (saved {cov_path} and {hist_path})")
+    return to_theta(x), float(L)
 
 
 def main():
@@ -947,7 +1082,27 @@ def main():
                               "evaluation metrics for reference.")
     parser.add_argument("--sensitivity-only", action="store_true",
                          help="only run and print the sensitivity screen, skip optimization")
+    lm = parser.add_argument_group("Levenberg-Marquardt (--optimizer lm; needs --windows years)")
+    lm.add_argument("--optimizer", choices=("adam", "lm"), default="adam",
+                    help="adam (default) or lm: Levenberg-Marquardt with a forward-mode Jacobian "
+                         "(meant for a handful of parameters; reports parameter uncertainty)")
+    lm.add_argument("--lm-lambda0", type=float, default=1e-2, help="initial damping (x diag(J^T J))")
+    lm.add_argument("--lm-max-trials", type=int, default=4,
+                    help="rejected trial steps per iteration before stopping (default 4)")
+    lm.add_argument("--lm-max-step", type=float, default=0.5,
+                    help="max |step| per iteration in log units (0.5 = x/÷1.65; default 0.5)")
+    lm.add_argument("--lm-jacobian-chunk", type=int, default=0,
+                    help="truncate the Jacobian every N steps (0 = whole window, no truncation; default)")
+    lm.add_argument("--lm-xtol", type=float, default=1e-3,
+                    help="stop when the largest log-parameter step is below this (default 1e-3 = 0.1%%)")
     args = parser.parse_args()
+    if args.optimizer == "lm":
+        if args.windows != "years":
+            parser.error("--optimizer lm needs --windows years")
+        if args.windows_per_iter:
+            parser.error("--optimizer lm uses all training windows every iteration; drop --windows-per-iter")
+        if not args.params:
+            parser.error("--optimizer lm needs --params")
 
     os.chdir(args.data_dir)
     lake_num = 1
@@ -956,7 +1111,9 @@ def main():
     run_config = get_run_config("./run_config.csv", lake_num)
     ice_and_snow = get_ice_and_snow("./ice_and_snow.csv", lake_num)
 
-    windfactor = float(lake_config["WindSpeed"])
+    # wind: only model_params.csv wind_factor scales wind (applied in full_step / run_wq_model);
+    # lake_config.csv no longer has a WindSpeed multiplier.
+    windfactor = 1.0  # meteo wind used unscaled by provide_meteorology()
     nx = int(run_config["nx"]); dt = float(run_config["dt"]); dx = float(run_config["dx"])
     area, depth, volume, hypso_weight = get_hypsography(
         hypsofile=run_config["hypso_ini_file"], dx=dx, nx=nx, outflow_depth=float(lake_config["outflow_depth"]),
@@ -979,7 +1136,7 @@ def main():
     n_steps_full = len(pd.date_range(desired_start, desired_end, freq="h"))
     n_steps = args.steps if args.steps is not None else n_steps_full
     step_times = np.arange(1, (n_steps + 1) * dt, dt)[:n_steps]
-    forcing = build_forcing_series(meteo_all, step_times, windfactor)
+    forcing = build_forcing_series(meteo_all, step_times)
     forcing = add_wq_forcing_series(forcing, tp_boundary, carbon_data, step_times)
 
     mean_depth = float(np.sum(volume) / np.max(area))
@@ -1269,68 +1426,71 @@ def main():
         for n, (s, b) in scaled.items():
             print(f"    {n:16s} step x{s:g} (~{100 * (np.exp(args.lr * s) - 1):.0f}% per iteration), range {b:g}x")
 
-    opt = optax.adam(args.lr)
-    opt_state = opt.init(theta_log)
+    if args.optimizer == "lm":
+        best_theta_log, best_loss = run_lm(args, wl, wl_test, all_idx, selected, theta_log0, log_lo, log_hi)
+    else:
+        opt = optax.adam(args.lr)
+        opt_state = opt.init(theta_log)
 
-    early_stop_msg = (
-        f"early-stopping after {args.early_stop_patience} stalled iteration(s) "
-        f"(tol={args.early_stop_tol:.4g})" if args.early_stop_patience > 0 else "early-stopping disabled"
-    )
-    print(f"\nRunning up to {args.iters} Adam iterations ({n_steps} steps/iteration across {n_chunks} "
-          f"gradient-truncated chunk(s), jitted -- first iteration includes compile time; {early_stop_msg})...")
-    best_loss, best_theta_log = float(val0), dict(theta_log0)
-    history = [float(val0)]
-    stall_count = 0  # consecutive iterations with no "significant" improvement -- see --early-stop-patience
-    for it in range(args.iters):
-        t0 = time.time()
-        if wl is not None and args.refresh_every and it > 0 and it % args.refresh_every == 0:
-            wl.refresh(theta_log, f" at iteration {it}")
-            if wl_test is not None:
-                wl_test.states = wl.states
-            # losses before and after a refresh aren't comparable (different start
-            # states), so re-score the best parameters with the new states
-            best_loss = float(wl.value(best_theta_log, all_idx))
-            print(f"  [windows] best parameters re-scored with the new states: loss={best_loss:.6g}")
-        loss_val, grads = grad_fn(theta_log)
-        jax.block_until_ready((loss_val, grads))  # see note above on async dispatch
-        non_finite = any(not bool(jnp.all(jnp.isfinite(v))) for v in grads.values()) or not np.isfinite(float(loss_val))
-        if non_finite:
-            print(f"  iter {it}: non-finite loss/gradient encountered -- stopping early "
-                  "(see jax_lakeModel_functions.py's module docstring on the gradient horizon; "
-                  "try a smaller --chunk-steps). Keeping the best result found so far.")
-            break
-        # `loss_val` was evaluated at the parameters *before* this update --
-        # keep a copy so "best" refers to parameters that were actually
-        # scored, not the untested ones one step further along.
-        theta_evaluated = dict(theta_log)
-        updates, opt_state = opt.update(grads, opt_state, theta_log)
-        # Per-parameter step multiplier (see DEFAULT_PARAM_LR_SCALE) --
-        # applied to Adam's update, since Adam itself is invariant to
-        # rescaling the gradient.
-        updates = {name: u * step_scale[name] for name, u in updates.items()}
-        theta_log = optax.apply_updates(theta_log, updates)
-        theta_log = {name: jnp.clip(v, log_lo[name], log_hi[name]) for name, v in theta_log.items()}
-        t1 = time.time()
-        loss_f = float(loss_val)
-        history.append(loss_f)
-        # Relative to the best loss seen *before* this iteration -- matches
-        # the sense of "has progress stalled", not just "did this exact
-        # step improve on the previous one" (which would be noisy with Adam).
-        improved_enough = (best_loss - loss_f) > args.early_stop_tol * max(abs(best_loss), 1e-12)
-        if loss_f < best_loss:
-            best_loss, best_theta_log = loss_f, theta_evaluated
-        print(f"  iter {it:3d}: loss={loss_f:.6g}  ({t1 - t0:.1f}s)")
-        if args.early_stop_patience > 0:
-            if improved_enough:
-                stall_count = 0
-            else:
-                stall_count += 1
-                if stall_count >= args.early_stop_patience:
-                    print(f"  iter {it}: loss hasn't improved by more than "
-                          f"{args.early_stop_tol:.4g} (relative) for "
-                          f"{args.early_stop_patience} consecutive iteration(s) -- stopping "
-                          "early. Keeping the best result found so far.")
-                    break
+        early_stop_msg = (
+            f"early-stopping after {args.early_stop_patience} stalled iteration(s) "
+            f"(tol={args.early_stop_tol:.4g})" if args.early_stop_patience > 0 else "early-stopping disabled"
+        )
+        print(f"\nRunning up to {args.iters} Adam iterations ({n_steps} steps/iteration across {n_chunks} "
+              f"gradient-truncated chunk(s), jitted -- first iteration includes compile time; {early_stop_msg})...")
+        best_loss, best_theta_log = float(val0), dict(theta_log0)
+        history = [float(val0)]
+        stall_count = 0  # consecutive iterations with no "significant" improvement -- see --early-stop-patience
+        for it in range(args.iters):
+            t0 = time.time()
+            if wl is not None and args.refresh_every and it > 0 and it % args.refresh_every == 0:
+                wl.refresh(theta_log, f" at iteration {it}")
+                if wl_test is not None:
+                    wl_test.states = wl.states
+                # losses before and after a refresh aren't comparable (different start
+                # states), so re-score the best parameters with the new states
+                best_loss = float(wl.value(best_theta_log, all_idx))
+                print(f"  [windows] best parameters re-scored with the new states: loss={best_loss:.6g}")
+            loss_val, grads = grad_fn(theta_log)
+            jax.block_until_ready((loss_val, grads))  # see note above on async dispatch
+            non_finite = any(not bool(jnp.all(jnp.isfinite(v))) for v in grads.values()) or not np.isfinite(float(loss_val))
+            if non_finite:
+                print(f"  iter {it}: non-finite loss/gradient encountered -- stopping early "
+                      "(see jax_lakeModel_functions.py's module docstring on the gradient horizon; "
+                      "try a smaller --chunk-steps). Keeping the best result found so far.")
+                break
+            # `loss_val` was evaluated at the parameters *before* this update --
+            # keep a copy so "best" refers to parameters that were actually
+            # scored, not the untested ones one step further along.
+            theta_evaluated = dict(theta_log)
+            updates, opt_state = opt.update(grads, opt_state, theta_log)
+            # Per-parameter step multiplier (see DEFAULT_PARAM_LR_SCALE) --
+            # applied to Adam's update, since Adam itself is invariant to
+            # rescaling the gradient.
+            updates = {name: u * step_scale[name] for name, u in updates.items()}
+            theta_log = optax.apply_updates(theta_log, updates)
+            theta_log = {name: jnp.clip(v, log_lo[name], log_hi[name]) for name, v in theta_log.items()}
+            t1 = time.time()
+            loss_f = float(loss_val)
+            history.append(loss_f)
+            # Relative to the best loss seen *before* this iteration -- matches
+            # the sense of "has progress stalled", not just "did this exact
+            # step improve on the previous one" (which would be noisy with Adam).
+            improved_enough = (best_loss - loss_f) > args.early_stop_tol * max(abs(best_loss), 1e-12)
+            if loss_f < best_loss:
+                best_loss, best_theta_log = loss_f, theta_evaluated
+            print(f"  iter {it:3d}: loss={loss_f:.6g}  ({t1 - t0:.1f}s)")
+            if args.early_stop_patience > 0:
+                if improved_enough:
+                    stall_count = 0
+                else:
+                    stall_count += 1
+                    if stall_count >= args.early_stop_patience:
+                        print(f"  iter {it}: loss hasn't improved by more than "
+                              f"{args.early_stop_tol:.4g} (relative) for "
+                              f"{args.early_stop_patience} consecutive iteration(s) -- stopping "
+                              "early. Keeping the best result found so far.")
+                        break
 
     print(f"\nBest loss: {best_loss:.6g}  (baseline was {float(val0):.6g}, "
           f"{100 * (1 - best_loss / float(val0)):.1f}% reduction)"
@@ -1339,7 +1499,8 @@ def main():
         # Losses from before and after start-state refreshes aren't directly
         # comparable, so score initial and best parameters once more on the same
         # footing: start states from a reference run with the best parameters.
-        wl.refresh({n: best_theta_log[n] for n in selected}, " at the best parameters")
+        if args.optimizer != "lm":   # run_lm already refreshed at the best parameters
+            wl.refresh({n: best_theta_log[n] for n in selected}, " at the best parameters")
         tr0, tr1 = float(wl.value(theta_log0, all_idx)), float(wl.value(best_theta_log, all_idx))
         print(f"  windowed training loss (same start states): {tr0:.6g} (initial) -> {tr1:.6g} (best), "
               f"{100 * (1 - tr1 / tr0):.1f}% reduction")

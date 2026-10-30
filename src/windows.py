@@ -92,20 +92,20 @@ def build_setup(lake_dir, record_end=None, temp_obs="profiles", load_obs=True):
     try:
         lc = get_lake_config("./lake_config.csv", 1); mp = get_model_params("./model_params.csv", 1)
         rc = get_run_config("./run_config.csv", 1); ias = get_ice_and_snow("./ice_and_snow.csv", 1)
-        wf = float(lc["WindSpeed"]); nx = int(rc["nx"]); dt = float(rc["dt"]); dx = float(rc["dx"])
+        nx = int(rc["nx"]); dt = float(rc["dt"]); dx = float(rc["dx"])
         area, depth, volume, hw = get_hypsography(hypsofile=rc["hypso_ini_file"], dx=dx, nx=nx,
                                                   outflow_depth=float(lc["outflow_depth"]))
         start = pd.Timestamp(rc["start_time"])
         end = pd.Timestamp(record_end) if record_end else pd.Timestamp(rc["end_time"])
         n = len(pd.date_range(start, end, freq="h"))
         step_times = np.arange(1, (n + 1) * dt, dt)[:n]
-        met = provide_meteorology(meteofile=rc["meteo_ini_file"], windfactor=wf, lat=lc["Latitude"],
+        met = provide_meteorology(meteofile=rc["meteo_ini_file"], windfactor=1.0, lat=lc["Latitude"],
                                   lon=lc["Longitude"], elev=lc["Elevation"], startDate=start)
         u0 = initial_profile(initfile=rc["u_ini_file"], nx=nx, dx=dx, depth=depth, startDate=start)
         wq = wq_initial_profile(initfile=rc["wq_ini_file"], nx=nx, dx=dx, depth=depth, volume=volume, startDate=start)
         tp = provide_phosphorus(tpfile=rc["tp_ini_file"], startingDate=start, startTime=1)
         cd = provide_carbon(ocloadfile=rc["oc_load_file"], startingDate=start, startTime=1).dropna(subset=["oc"])
-        forcing = add_wq_forcing_series(build_forcing_series(met, step_times, wf), tp, cd, step_times)
+        forcing = add_wq_forcing_series(build_forcing_series(met, step_times), tp, cd, step_times)
         geom = default_geometry_wq(area=area, depth=depth, volume=volume, dx=dx, dt=dt,
                                    latitude=float(lc["Latitude"]), altitude=float(lc["Elevation"]),
                                    hypso_weight=hw, mean_depth=float(np.sum(volume) / np.max(area)),

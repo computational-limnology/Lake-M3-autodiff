@@ -69,10 +69,17 @@ from jax_lakeModel_functions import (
 DEFAULT_CHUNK_STEPS = 200
 
 
-def build_forcing_series(daily_meteo, times, wind_factor):
+def build_forcing_series(daily_meteo, times):
     """Reproduce exactly the `interp1d(..., kind='linear')` calls used in
     `run_wq_model()` (lines ~4259-4279 of processBased_lakeModel_functions.py)
-    so the forcing seen by the JAX model matches the numpy model bit-for-bit."""
+    so the forcing seen by the JAX model matches the numpy model bit-for-bit.
+
+    Wind speed is the unscaled meteo wind: the only wind multiplier is
+    model_params.csv's `wind_factor`, applied inside `full_step`
+    (`Uw_eff = forcing["Uw"] * params["wind_factor"]`). This function used to
+    take lake_config.csv's WindSpeed and multiply by it a second time (on top
+    of provide_meteorology()), so the effective wind was WindSpeed^2 *
+    wind_factor; lake_config's WindSpeed has been removed (2026-10-29)."""
 
     def interp(col, factor=1.0):
         vals = daily_meteo[col].values * factor
@@ -85,7 +92,7 @@ def build_forcing_series(daily_meteo, times, wind_factor):
         Jlw=interp("Longwave_Radiation_Downwelling_wattPerMeterSquared"),
         Tair=interp("Air_Temperature_celsius"),
         ea=interp("ea"),
-        Uw=interp("Ten_Meter_Elevation_Wind_Speed_meterPerSecond", factor=wind_factor),
+        Uw=interp("Ten_Meter_Elevation_Wind_Speed_meterPerSecond"),
         CC=interp("Cloud_Cover"),
         Pa=interp("Surface_Level_Barometric_Pressure_pascal"),
         RH=interp("Relative_Humidity_percent"),
@@ -193,7 +200,9 @@ def main():
     run_config = get_run_config("./run_config.csv", lake_num)
     ice_and_snow = get_ice_and_snow("./ice_and_snow.csv", lake_num)
 
-    windfactor = float(lake_config["WindSpeed"])
+    # wind: only model_params.csv wind_factor scales wind (applied in full_step / run_wq_model);
+    # lake_config.csv no longer has a WindSpeed multiplier.
+    windfactor = 1.0  # meteo wind used unscaled by provide_meteorology()
     nx = int(run_config["nx"])
     dt = float(run_config["dt"])
     dx = float(run_config["dx"])
@@ -230,7 +239,7 @@ def main():
         f"({len(step_times)} hourly steps, nx={nx} vertical grid cells)"
     )
 
-    forcing = build_forcing_series(meteo_all, step_times, windfactor)
+    forcing = build_forcing_series(meteo_all, step_times)
 
     geometry = dict(
         area=jnp.asarray(area), depth=jnp.asarray(depth), volume=jnp.asarray(volume),

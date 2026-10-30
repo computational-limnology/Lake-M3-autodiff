@@ -83,7 +83,9 @@ for lake_num in range(1, num_lakes + 1):
     ice_and_snow = get_ice_and_snow(
         "./ice_and_snow.csv", lake_num
     )
-    windfactor = float(lake_config["WindSpeed"])
+    # wind: only model_params.csv wind_factor scales wind (applied in full_step / run_wq_model);
+    # lake_config.csv no longer has a WindSpeed multiplier.
+    windfactor = 1.0  # meteo wind used unscaled by provide_meteorology()
     zmax = lake_config['Zmax']
     nx = int(run_config["nx"])# number of layers we will have
     dt = float(run_config["dt"])# 24 hours times 60 min/hour times 60 seconds/min to convert s to day

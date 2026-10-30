@@ -1116,7 +1116,9 @@ def main():
     run_config = get_run_config("./run_config.csv", lake_num)
     ice_and_snow = get_ice_and_snow("./ice_and_snow.csv", lake_num)
 
-    windfactor = float(lake_config["WindSpeed"])
+    # wind: only model_params.csv wind_factor scales wind (applied in full_step / run_wq_model);
+    # lake_config.csv no longer has a WindSpeed multiplier.
+    windfactor = 1.0  # meteo wind used unscaled by provide_meteorology()
     nx = int(run_config["nx"]); dt = float(run_config["dt"]); dx = float(run_config["dx"])
     area, depth, volume, hypso_weight = get_hypsography(
         hypsofile=run_config["hypso_ini_file"], dx=dx, nx=nx, outflow_depth=float(lake_config["outflow_depth"]),
@@ -1139,7 +1141,7 @@ def main():
     n_steps_full = len(pd.date_range(desired_start, desired_end, freq="h"))
     n_steps = args.steps if args.steps is not None else n_steps_full
     step_times = np.arange(1, (n_steps + 1) * dt, dt)[:n_steps]
-    forcing = build_forcing_series(meteo_all, step_times, windfactor)
+    forcing = build_forcing_series(meteo_all, step_times)
     forcing = add_wq_forcing_series(forcing, tp_boundary, carbon_data, step_times)
 
     mean_depth = float(np.sum(volume) / np.max(area))
@@ -1453,9 +1455,8 @@ def main():
         E_seiche_baseline=np.asarray(baseline["E_seiche"]), E_seiche_hybrid=np.asarray(hybrid["E_seiche"]),
         kd_light_baseline=np.asarray(baseline["kd_light"]), kd_light_hybrid=np.asarray(hybrid["kd_light"]),
         train_lo=train_lo, train_hi=train_hi, test_lo=test_lo, test_hi=test_hi,
-        # raw meteorological wind speed (lake_config.csv's WindSpeed factor
-        # already applied, same series the model itself is driven by, before
-        # model_params.csv's wind_factor) -- cheap to save unconditionally,
+        # raw (unscaled) meteorological wind speed, the series the model is
+        # driven by before model_params.csv's wind_factor -- cheap to save unconditionally,
         # useful context for any diagnostic plot (see plot_ri_diagnostics.py).
         wind_speed=np.asarray(forcing["Uw"][:n_steps]),
     )
