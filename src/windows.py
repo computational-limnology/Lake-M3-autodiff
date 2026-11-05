@@ -58,6 +58,10 @@ if __name__ == "__main__":   # device flags must be set before JAX is imported
     _argv = sys.argv
     _dev = int(_argv[_argv.index("--devices") + 1]) if "--devices" in _argv else 1
     configure_devices(_dev, "--single-thread" in _argv)
+    if _dev > 1:   # hide XLA's harmless multi-device "may be stuck" messages (xla_log_filter.py)
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+        import xla_log_filter
+        xla_log_filter.install()
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402

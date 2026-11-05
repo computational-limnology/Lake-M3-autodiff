@@ -1237,7 +1237,8 @@ def _kp_ratio_jvp(primals, tangents):
     return kp, dkp_dke * d_ke + dkp_ddd * d_dd + rel(g) * d_g + rel(vw) * d_vw + rel(lever) * d_lever
 
 
-def mixing_step(u, depth, area, volume, dx, dt, Uw, ice, g=9.81, Cd=0.0013, W_str=None, tracers=()):
+def mixing_step(u, depth, area, volume, dx, dt, Uw, ice, g=9.81, Cd=0.0013, W_str=None, tracers=(),
+                ke_scale=None, dissip_len=None, return_diag=False):
     """Wind-mixing search from `mixing_module_minlake_RL`. `tracers` is an
     optional tuple of extra state arrays *already expressed as
     concentrations* (state/volume -- matching the numpy reference's
@@ -1245,7 +1246,18 @@ def mixing_step(u, depth, area, volume, dx, dt, Uw, ice, g=9.81, Cd=0.0013, W_st
     with exactly the same zb/KP_ratio decisions as temperature; the
     caller is responsible for converting mass <-> concentration and for
     the `o2`/`docr`/... <-> `tracers` tuple bookkeeping. Returns
-    `(u_out, tracers_out)`."""
+    `(u_out, tracers_out)`.
+
+    MCL hooks (2026-11-04; defaults leave the computation unchanged):
+      ke_scale    multiplies the wind energy KE0 (entrainment efficiency).
+      dissip_len  [m] energy loss during deepening: after every fully merged
+                  layer the remaining energy is (KE - POE) * exp(-dx / dissip_len)
+                  (the reference only subtracts POE).
+      return_diag also return dict(KE0, KE_used [J], n_full = layers fully
+                  merged, kp_partial = fraction of the last layer entrained
+                  (0 if none), mld = mixed-layer depth after mixing [m],
+                  ke_scale = the factor used (1 if None), KE_diss = energy lost
+                  to dissip_len [J]) as a third element."""
     nx = u.shape[0]
     if W_str is None:
         W_str = 1.0 - jnp.exp(-0.3 * jnp.max(area) / 1e6)
@@ -1267,12 +1279,17 @@ def mixing_step(u, depth, area, volume, dx, dt, Uw, ice, g=9.81, Cd=0.0013, W_st
     # `sqrt`'s local derivative finite.
     KE0 = W_str * jnp.max(area) * jnp.sqrt(jnp.maximum(tau ** 3 / calc_dens(u[0]), 1e-30)) * dt
     KE0 = jnp.where(ice, 0.0, KE0)
+    if ke_scale is not None:
+        KE0 = KE0 * ke_scale
 
     idx = jnp.arange(nx)
     n_tracers = len(tracers)
 
     def body(_, state):
-        u, tracers, KE, active = state
+        if return_diag:
+            u, tracers, KE, active, n_full, kp_part, e_diss = state
+        else:
+            u, tracers, KE, active = state
         rho = calc_dens(u)
         d_rho = rho[1:] - rho[:-1]
         mask_pos = d_rho > 0
@@ -1321,13 +1338,33 @@ def mixing_step(u, depth, area, volume, dx, dt, Uw, ice, g=9.81, Cd=0.0013, W_st
         new_tracers = tuple(merge(t) for t in tracers)
 
         KE_branch1 = KE - POE
+        if dissip_len is not None:
+            KE_lost = KE_branch1 * (1.0 - jnp.exp(-dx / dissip_len))
+            KE_branch1 = KE_branch1 - KE_lost
         KE_branch2 = 0.0
         new_KE_upd = jnp.where(branch_gt1, KE_branch1, KE_branch2)
         new_active_upd = jnp.where(branch_gt1, active, False)
         new_KE = jnp.where(do_update, new_KE_upd, KE)
         new_active = jnp.where(do_update, new_active_upd, jnp.where(stop_now, False, active))
+        if return_diag:
+            n_full = n_full + jnp.where(do_update & branch_gt1, 1.0, 0.0)
+            kp_part = jnp.where(do_update & ~branch_gt1, KP_ratio, kp_part)
+            if dissip_len is not None:
+                e_diss = e_diss + jnp.where(do_update & branch_gt1, KE_lost, 0.0)
+            return (new_u, new_tracers, new_KE, new_active, n_full, kp_part, e_diss)
         return (new_u, new_tracers, new_KE, new_active)
 
+    if return_diag:
+        u_out, tracers_out, KE_left, _, n_full, kp_part, e_diss = lax.fori_loop(
+            0, nx, body, (u, tuple(tracers), KE0, True, jnp.asarray(0.0), jnp.asarray(0.0), jnp.asarray(0.0)))
+        rho_out = calc_dens(u_out)
+        pos = (rho_out[1:] - rho_out[:-1]) > 0
+        mld = jnp.where(jnp.any(pos), depth[jnp.argmax(pos)] + dx / 2, depth[-1] + dx / 2)
+        # KE_left = energy left after the last full merge; a partial entrainment uses all of it
+        used = jnp.where(kp_part > 0, KE0, KE0 - KE_left) - e_diss
+        mdiag = dict(KE0=KE0, KE_used=used, n_full=n_full, kp_partial=kp_part, mld=mld,
+                     ke_scale=jnp.asarray(1.0 if ke_scale is None else ke_scale, dtype=KE0.dtype), KE_diss=e_diss)
+        return u_out, (tracers_out if n_tracers else ()), mdiag
     u_out, tracers_out, _, _ = lax.fori_loop(0, nx, body, (u, tuple(tracers), KE0, True))
     if n_tracers == 0:
         return u_out, ()
@@ -1584,10 +1621,16 @@ def k600_to_kgas_o2(k600, temperature):
 # ---------------------------------------------------------------------------
 
 
-def oxygen_boundary_step(u, o2, area, volume, dt, altitude, ice, Pa, Tair, Uw, theta_r, f_sod, d_thick):
+def oxygen_boundary_step(u, o2, area, volume, dt, altitude, ice, Pa, Tair, Uw, theta_sod, f_sod, d_thick,
+                         kgas_factor=1.0):
+    # kgas_factor (model_params, default 1): multiplier on the open-water gas
+    # transfer velocity from k_vachon/k600_to_kgas_o2 (calibratable; the
+    # model_params row `piston_velocity` is not used).
+    # theta_sod: Arrhenius base of the sediment oxygen demand (model_params
+    # row theta_sod; was theta_r, which still sets water-column respiration).
     piston_velocity_ice = 1e-5 / 86400
     k600 = k_vachon(Uw, area[0])
-    piston_velocity_open = k600_to_kgas_o2(k600, Tair) / 86400
+    piston_velocity_open = kgas_factor * k600_to_kgas_o2(k600, Tair) / 86400
     piston_velocity = jnp.where(ice, piston_velocity_ice, piston_velocity_open)
 
     o2_sat = do_sat_calc(u[0], baro=Pa, altitude=altitude)
@@ -1606,7 +1649,7 @@ def oxygen_boundary_step(u, o2, area, volume, dt, altitude, ice, Pa, Tair, Uw, t
     F_sed_diff = d_sod[-1] * (C_o2[-1] - C_sed[-1]) / d_thick
     sed_oxygen_loss = sed_oxygen_loss.at[-1].add(A_sed[-1] * F_sed_diff)
 
-    do_consumption = sed_oxygen_loss * dt * theta_r ** (u - 20)
+    do_consumption = sed_oxygen_loss * dt * theta_sod ** (u - 20)
     o2 = o2 - jnp.minimum(o2, do_consumption)
     return o2, atm_flux, do_consumption
 
@@ -1687,7 +1730,8 @@ def _prodcons_pd_matrices(y, consumption, npp, resp, beta):
     return p, d
 
 
-def compute_npp(u, area, H, TP, theta_npp, sw_to_par=2.114):
+def compute_npp(u, area, H, TP, theta_npp, sw_to_par=2.114, P_max=1.5e-6, alpha_P=0.03, k_TP=60.0,
+                LIGHTUSEBYPHOTOS=0.3):
     """Depth-resolved net primary production (same units `npp` has inside
     `_prodcons_pd_matrices`/`_prodcons_single_layer` -- mol C/s, before the
     `86400 s/day * 12.0 g/mol` conversion `prodcons_step`'s own
@@ -1702,13 +1746,19 @@ def compute_npp(u, area, H, TP, theta_npp, sw_to_par=2.114):
     (`processBased_lakeModel_functions.py`, untouched reference) exactly --
     same constants, same formula -- just lifted out of
     `_prodcons_single_layer` so it no longer needs `area`/`H`/`TP`/
-    `theta_npp`/`sw_to_par` passed through it at all."""
+    `theta_npp`/`sw_to_par` passed through it at all.
+
+    P_max [mol C m-2 s-1], alpha_P [-] and k_TP [ug/L] are the reference's
+    hardcoded constants (1.5e-6, 0.03, 60); they are exposed as the
+    calibratable model_params `npp_pmax`, `npp_alpha`, `npp_k_tp` (defaults =
+    those constants, so results are unchanged unless they are set). The
+    model_params rows `p_max`/`IP` (different units) are not used.
+    LIGHTUSEBYPHOTOS [-] (fraction of ambient light used by phytoplankton) is
+    the model_params row of that name (default 0.3, the reference's hardcoded
+    value). It only enters as the product alpha_P * LIGHTUSEBYPHOTOS, so it
+    cannot be calibrated jointly with npp_alpha."""
     PAR = H * sw_to_par / 1e6  # mol/m2/s
-    P_max = 1.5e-6  # mol C/m2/s
-    alpha_P = 0.03
-    LIGHTUSEBYPHOTOS = 0.3  # matches the reference's hardcoded shadow of the caller's value
     P_I = P_max * (1 - jnp.exp(-(alpha_P * LIGHTUSEBYPHOTOS) * PAR / P_max))
-    k_TP = 60.0  # 0.06 * 1000
     f_TP = TP / (k_TP + TP)
     temp_factor = theta_npp ** (u - 20)
     return P_I * f_TP * temp_factor * area
@@ -1920,19 +1970,24 @@ def full_step(state, forcing, geometry, params):
     )
 
     # 5. O2 boundary (atmospheric exchange + sediment oxygen demand)
+    o2_pre = o2   # O2 budget diagnostics (g per layer per step): see the `diagnostics` dict below
     o2, atm_flux, do_consumption = oxygen_boundary_step(
         u, o2, area, volume, dt, geometry["altitude"], ice, forcing["Pa"], forcing["Tair"], Uw_eff,
-        params["theta_r"], params["f_sod"], params["d_thick"],
+        params["theta_sod"], params["f_sod"], params["d_thick"], params["kgas_factor"],
     )
+    o2_atm = jnp.zeros_like(o2).at[0].set(atm_flux * dt)
+    o2_sod = (o2 - o2_pre) - o2_atm
 
     # 6. mixing (temperature + all 5 WQ tracers, as concentrations)
+    o2_pre = o2
     o2c, docrc, doclc, pocrc, poclc = o2 / volume, docr / volume, docl / volume, pocr / volume, pocl / volume
-    u, (o2c, docrc, doclc, pocrc, poclc) = mixing_step(
+    u, (o2c, docrc, doclc, pocrc, poclc), mix_diag = mixing_step(
         u, depth, area, volume, dx, dt, Uw_eff, ice, g=params["g"], Cd=params["Cd"],
-        W_str=params["W_str"], tracers=(o2c, docrc, doclc, pocrc, poclc),
+        W_str=params["W_str"], tracers=(o2c, docrc, doclc, pocrc, poclc), return_diag=True,
     )
     o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
     pocr, pocl = pocrc * volume, poclc * volume
+    o2_mix = o2 - o2_pre
 
     # 7. eddy diffusivity
     dens_u = calc_dens(u)
@@ -1953,9 +2008,11 @@ def full_step(state, forcing, geometry, params):
     kz = kz_process
 
     # 8. diffusion (temperature + O2 + DOCr + DOCl, as concentrations)
+    o2_pre = o2
     o2c, docrc, doclc = o2 / volume, docr / volume, docl / volume
     u, o2c, docrc, doclc = diffusion_step_wq(u, o2c, docrc, doclc, kz, area, dx, dt)
     o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
+    o2_diff = o2 - o2_pre
 
     # 9. POC settling
     pocr, pocl = poc_settling_step(
@@ -1976,13 +2033,19 @@ def full_step(state, forcing, geometry, params):
     # feed the result in" pattern step 7 above uses for `kz` before
     # `diffusion_step_wq()`/`poc_settling_step()`. See compute_npp()'s
     # docstring.
-    npp = compute_npp(u, area, H, forcing["TP"], params["theta_npp"])
+    npp = compute_npp(u, area, H, forcing["TP"], params["theta_npp"], P_max=params["npp_pmax"],
+                      alpha_P=params["npp_alpha"], k_TP=params["npp_k_tp"],
+                      LIGHTUSEBYPHOTOS=params["LIGHTUSEBYPHOTOS"])
+    o2_pre = o2
     o2, docr, docl, pocr, pocl, diag = prodcons_step(
         u, o2, docr, docl, pocr, pocl, volume, npp, dt,
         params["theta_r"], params["k_half"],
         (params["resp_docr"], params["resp_docl"], params["resp_pocr"], params["resp_pocl"]),
-        params["beta"],
+        params["beta_oc"],
     )
+    o2_bio = o2 - o2_pre
+    # gross O2 production of NPP (32 g O2 per mol C; bottom layer excluded like prodcons_step)
+    o2_npp = jnp.where(jnp.arange(o2.shape[0]) < o2.shape[0] - 1, npp * 32.0 * dt, 0.0)
 
     # 12. hydrologic outflow (DOC/POC only, not O2)
     outflow_frac = geometry["outflow_frac"]
@@ -2013,11 +2076,20 @@ def full_step(state, forcing, geometry, params):
     diagnostics = dict(
         kd_light=kd_light, atm_flux=atm_flux, kz_process=kz_process, ri_process=ri_process,
         Q_net=Q_net, npp=npp, **diag,
+        # O2 budget per layer and step [g O2]; they add up exactly to the O2
+        # change of the step (o2_new - o2_old). o2_bio = NPP production minus
+        # respiration (o2_npp is its gross production part).
+        o2_atm=o2_atm, o2_sod=o2_sod, o2_mix=o2_mix, o2_diff=o2_diff, o2_bio=o2_bio, o2_npp=o2_npp,
+        # wind-mixing (mixing_step) diagnostics: energy input and use [J], layers
+        # fully merged, fraction of the last layer entrained, mixed-layer depth [m]
+        mix_KE0=mix_diag["KE0"], mix_KE_used=mix_diag["KE_used"], mix_n_full=mix_diag["n_full"],
+        mix_kp_partial=mix_diag["kp_partial"], mix_mld=mix_diag["mld"],
+        mix_ke_scale=mix_diag["ke_scale"], mix_KE_diss=mix_diag["KE_diss"],
     )
     return new_state, diagnostics
 
 
-def full_step_mcl(state, forcing, geometry, params, kz_override=None):
+def full_step_mcl(state, forcing, geometry, params, kz_override=None, mix_override=None):
     """EXPERIMENTAL (MCL mode): copy of `full_step()` with a hook that lets a
     machine-learning correction replace the eddy diffusivity. Used only by
     the MCL scripts (train_M3_mcl_jax.py's hybrid simulation, and through
@@ -2050,7 +2122,18 @@ def full_step_mcl(state, forcing, geometry, params, kz_override=None):
     (surface/bottom temperature, ice state) reflect this step's own state
     rather than the previous step's, and so it can fit a stability function
     directly against `ri` instead of (or as well as) correcting
-    `kz_process`. With `kz_override=None` the result is identical to `full_step()`."""
+    `kz_process`. With `kz_override=None` the result is identical to `full_step()`.
+
+    A callable kz_override with attribute `wants_mix_diag = True` is also
+    passed this step's wind-mixing diagnostics (`mix_diag=`, see mixing_step;
+    wind mixing runs before the eddy diffusivity in the step).
+
+    `mix_override`, if given, is a callable `mix_override(state, forcing, u, ice)
+    -> dict(ke_scale=..., dissip_len=...)` (either key optional) evaluated just
+    before the wind-mixing step with this step's post-heating/ice temperature;
+    the values are passed to `mixing_step` (entrainment efficiency and energy
+    loss during deepening; see its docstring). With `mix_override=None` the
+    wind mixing is identical to `full_step()`."""
     area, depth, volume = geometry["area"], geometry["depth"], geometry["volume"]
     dx, dt = geometry["dx"], geometry["dt"]
     docr, docl, pocr, pocl, o2 = state.docr, state.docl, state.pocr, state.pocl, state.o2
@@ -2102,19 +2185,25 @@ def full_step_mcl(state, forcing, geometry, params, kz_override=None):
     )
 
     # 5. O2 boundary (atmospheric exchange + sediment oxygen demand)
+    o2_pre = o2   # O2 budget diagnostics (g per layer per step): see the `diagnostics` dict below
     o2, atm_flux, do_consumption = oxygen_boundary_step(
         u, o2, area, volume, dt, geometry["altitude"], ice, forcing["Pa"], forcing["Tair"], Uw_eff,
-        params["theta_r"], params["f_sod"], params["d_thick"],
+        params["theta_sod"], params["f_sod"], params["d_thick"], params["kgas_factor"],
     )
+    o2_atm = jnp.zeros_like(o2).at[0].set(atm_flux * dt)
+    o2_sod = (o2 - o2_pre) - o2_atm
 
     # 6. mixing (temperature + all 5 WQ tracers, as concentrations)
+    o2_pre = o2
     o2c, docrc, doclc, pocrc, poclc = o2 / volume, docr / volume, docl / volume, pocr / volume, pocl / volume
-    u, (o2c, docrc, doclc, pocrc, poclc) = mixing_step(
+    mix_kw = mix_override(state, forcing, u, ice) if mix_override is not None else {}
+    u, (o2c, docrc, doclc, pocrc, poclc), mix_diag = mixing_step(
         u, depth, area, volume, dx, dt, Uw_eff, ice, g=params["g"], Cd=params["Cd"],
-        W_str=params["W_str"], tracers=(o2c, docrc, doclc, pocrc, poclc),
+        W_str=params["W_str"], tracers=(o2c, docrc, doclc, pocrc, poclc), return_diag=True, **mix_kw,
     )
     o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
     pocr, pocl = pocrc * volume, poclc * volume
+    o2_mix = o2 - o2_pre
 
     # 7. eddy diffusivity
     dens_u = calc_dens(u)
@@ -2135,14 +2224,19 @@ def full_step_mcl(state, forcing, geometry, params, kz_override=None):
     if kz_override is None:
         kz = kz_process
     elif callable(kz_override):
-        kz = kz_override(kz_process, u, ice, dens_u, forcing, ri_process)
+        if getattr(kz_override, "wants_mix_diag", False):
+            kz = kz_override(kz_process, u, ice, dens_u, forcing, ri_process, mix_diag=mix_diag)
+        else:
+            kz = kz_override(kz_process, u, ice, dens_u, forcing, ri_process)
     else:
         kz = kz_override
 
     # 8. diffusion (temperature + O2 + DOCr + DOCl, as concentrations)
+    o2_pre = o2
     o2c, docrc, doclc = o2 / volume, docr / volume, docl / volume
     u, o2c, docrc, doclc = diffusion_step_wq(u, o2c, docrc, doclc, kz, area, dx, dt)
     o2, docr, docl = o2c * volume, docrc * volume, doclc * volume
+    o2_diff = o2 - o2_pre
 
     # 9. POC settling
     pocr, pocl = poc_settling_step(
@@ -2163,13 +2257,19 @@ def full_step_mcl(state, forcing, geometry, params, kz_override=None):
     # feed the result in" pattern step 7 above uses for `kz` before
     # `diffusion_step_wq()`/`poc_settling_step()`. See compute_npp()'s
     # docstring.
-    npp = compute_npp(u, area, H, forcing["TP"], params["theta_npp"])
+    npp = compute_npp(u, area, H, forcing["TP"], params["theta_npp"], P_max=params["npp_pmax"],
+                      alpha_P=params["npp_alpha"], k_TP=params["npp_k_tp"],
+                      LIGHTUSEBYPHOTOS=params["LIGHTUSEBYPHOTOS"])
+    o2_pre = o2
     o2, docr, docl, pocr, pocl, diag = prodcons_step(
         u, o2, docr, docl, pocr, pocl, volume, npp, dt,
         params["theta_r"], params["k_half"],
         (params["resp_docr"], params["resp_docl"], params["resp_pocr"], params["resp_pocl"]),
-        params["beta"],
+        params["beta_oc"],
     )
+    o2_bio = o2 - o2_pre
+    # gross O2 production of NPP (32 g O2 per mol C; bottom layer excluded like prodcons_step)
+    o2_npp = jnp.where(jnp.arange(o2.shape[0]) < o2.shape[0] - 1, npp * 32.0 * dt, 0.0)
 
     # 12. hydrologic outflow (DOC/POC only, not O2)
     outflow_frac = geometry["outflow_frac"]
@@ -2200,6 +2300,15 @@ def full_step_mcl(state, forcing, geometry, params, kz_override=None):
     diagnostics = dict(
         kd_light=kd_light, atm_flux=atm_flux, kz_process=kz_process, ri_process=ri_process,
         Q_net=Q_net, npp=npp, **diag,
+        # O2 budget per layer and step [g O2]; they add up exactly to the O2
+        # change of the step (o2_new - o2_old). o2_bio = NPP production minus
+        # respiration (o2_npp is its gross production part).
+        o2_atm=o2_atm, o2_sod=o2_sod, o2_mix=o2_mix, o2_diff=o2_diff, o2_bio=o2_bio, o2_npp=o2_npp,
+        # wind-mixing (mixing_step) diagnostics: energy input and use [J], layers
+        # fully merged, fraction of the last layer entrained, mixed-layer depth [m]
+        mix_KE0=mix_diag["KE0"], mix_KE_used=mix_diag["KE_used"], mix_n_full=mix_diag["n_full"],
+        mix_kp_partial=mix_diag["kp_partial"], mix_mld=mix_diag["mld"],
+        mix_ke_scale=mix_diag["ke_scale"], mix_KE_diss=mix_diag["KE_diss"],
     )
     return new_state, diagnostics
 
@@ -2338,8 +2447,19 @@ def default_params(model_params: dict, ice_and_snow: dict = None,
         light_doc=float(model_params["light_doc"]),
         light_poc=float(model_params["light_poc"]),
         theta_r=float(model_params["theta_r"]),
+        # sediment oxygen demand temperature dependence; defaults to theta_r
+        # (the value both processes shared before), so older files are unchanged
+        theta_sod=float(model_params.get("theta_sod", model_params["theta_r"])),
         theta_npp=float(model_params["theta_npp"]),
         k_half=float(model_params["k_half"]),
+        # NPP light curve and P limitation (compute_npp) and the gas-transfer
+        # multiplier (oxygen_boundary_step). Optional rows; the defaults are
+        # the reference's hardcoded values, so older model_params.csv files
+        # give unchanged results.
+        npp_pmax=float(model_params.get("npp_pmax", 1.5e-6)),
+        npp_alpha=float(model_params.get("npp_alpha", 0.03)),
+        npp_k_tp=float(model_params.get("npp_k_tp", 60.0)),
+        kgas_factor=float(model_params.get("kgas_factor", 1.0)),
         # resp_*/settling_rate_* are day^-1 / m day^-1 in model_params.csv; run_wq_model (via
         # run_M3.py) always divides by 86400 before use, so we do the same here.
         resp_docr=float(model_params["resp_docr"]) / 86400,
@@ -2367,5 +2487,9 @@ def default_params(model_params: dict, ice_and_snow: dict = None,
         settling_rate_refractory=float(model_params["settling_rate_refractory"]) / 86400,
         f_sod=float(model_params["f_sod"]),
         d_thick=float(model_params["d_thick"]),
-        beta=0.8,  # not in model_params.csv; matches run_wq_model's own default, never overridden by run_M3.py
+        # beta_oc: fraction of NPP carbon going to labile POC (the rest to labile
+        # DOC), `beta` in _prodcons_pd_matrices; model_params row beta_oc
+        # (default 0.8 = run_wq_model's own default; replaces the unused row B).
+        beta_oc=float(model_params.get("beta_oc", 0.8)),
+        LIGHTUSEBYPHOTOS=float(model_params.get("LIGHTUSEBYPHOTOS", 0.3)),
     )

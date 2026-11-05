@@ -76,6 +76,34 @@ def test_bounds_and_max_step():
     assert (h["max_step"] <= 0.25 + 1e-12).all()
 
 
+def test_active_bound_is_held():
+    """x0 at its upper bound with the gradient pushing outward: lm_step must keep
+    it there and still optimise the free parameter (minimum of x1 at 2)."""
+    from lm_optimizer import lm_step
+    x = np.array([1.0, 0.0])
+    A = np.eye(2); g = np.array([-1.0, -2.0])          # r = (x0 - 2, x1 - 2) at x = (1, 0)
+    delta, pred = lm_step(x, A, g, 1e-6, lo=[-1, -5], hi=[1, 5], max_step=10)
+    assert delta[0] == 0.0 and np.isclose(delta[1], 2.0, rtol=1e-5) and pred > 0
+
+
+def test_stall_stop_with_refresh():
+    """Accepted but tiny steps (~1 %) with a refresh after every step (so the
+    loss test is skipped): LM must stop after 2 such steps, not run all iters."""
+    calls = {"n": 0}
+
+    def ne(x):
+        return np.eye(1) * 1e6, np.array([1e4]), 1.0     # GN step ~ -0.01
+
+    def loss(x):
+        calls["n"] += 1
+        return 1.0 - 1e-3 * calls["n"]                    # always a little lower -> accepted
+
+    out = lm_minimize(ne, loss, np.zeros(1), [-5], [5], max_iters=20, refresh=lambda x: None,
+                      refresh_every=1, ftol=1e-4, xtol=1e-4, log=_quiet)
+    assert "consecutive steps" in out["reason"], out["reason"]
+    assert len(out["history"]) == 3   # iteration 0 + 2 stalled steps
+
+
 def test_noisy_loss_stops():
     """A loss that never decreases (noise floor) ends with 'no decrease' instead of looping."""
     def ne(x):

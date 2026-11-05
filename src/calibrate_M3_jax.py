@@ -24,18 +24,19 @@ Usage:
 Key design choices
 -------------------
 Unit conversion (mass vs. concentration): the model's internal WQ state
-(`o2`, `docr`, `docl`, ...) is a per-layer *mass*, not a concentration --
-exactly like `wq_initial_profile()` in `processBased_lakeModel_functions.py`
-builds its initial condition as `observation * volume`. Observations here
-are converted the same way: `obs_mass = obs_concentration_mgL * volume`
-(volume in m^3; mg/L is numerically g/m^3, so this is already in the same
-mass units the model itself uses -- no extra factor needed). DOC is
+(`o2`, `docr`, `docl`, ...) is a per-layer *mass* (g = concentration *
+layer volume), exactly like `wq_initial_profile()` builds it. Losses and
+metrics compare *concentrations*: model mass / layer volume (`model_values`)
+against the observed mg/L (= g/m^3), so every layer counts equally. (Until
+2026-11-02 observations were converted to mass instead, which weighted the
+squared residuals by volume^2 -- Ravn's surface layers ~550x more than the
+near-bottom ones -- and made O2 RMSE values come out in mass units.) DOC is
 compared against `docr + docl` combined, since the model only initializes
 that 75/25 refractory/labile split heuristically and there is no separate
 refractory/labile observation to calibrate each piece against. Temperature
 needs no conversion. POC ("particulate organic carbon") is handled exactly
-the same way as DOC: compared against `pocr + pocl` combined, converted
-from mg/L the same `obs_mass = obs_concentration_mgL * volume` way. Unlike
+the same way as DOC: compared against `pocr + pocl` combined, divided by
+layer volume. Unlike
 temp/O2/DOC, POC observations are optional at the dataset level, not just
 possibly absent from a given window -- Ravn's `L0001-WQ.csv` has no "poc"
 rows at all, while Mendota's `ME_obs_depths3_wpoc.csv` does. This falls out
@@ -281,6 +282,10 @@ def _early_device_flags(argv):
     # the script's own output. They are hidden unless --xla-warnings is given.
     if "--devices" in argv and "--xla-warnings" not in argv:
         os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+        # newer jaxlib versions log these via absl, which ignores TF_CPP_MIN_LOG_LEVEL:
+        # filter them out of stderr directly (see xla_log_filter.py)
+        import xla_log_filter
+        xla_log_filter.install()
 
 
 if __name__ == "__main__":
@@ -337,13 +342,20 @@ DEFAULT_TOPK_PER_VARIABLE = 5
 # gradient magnitude away, so scaling the gradient would do nothing --
 # the multiplier is applied to Adam's *update* instead (see main()).
 # Override or extend from the command line with --lr-scale / --bound-factor.
-DEFAULT_PARAM_LR_SCALE = {"k_min": 5.0, "k_max": 5.0, "seiche_alpha": 5.0}
-DEFAULT_PARAM_BOUND_FACTOR = {"k_min": 100.0, "k_max": 100.0, "seiche_alpha": 100.0}
+DEFAULT_PARAM_LR_SCALE = {"k_min": 5.0, "k_max": 5.0, "seiche_alpha": 5.0,
+                          # Arrhenius bases enter as theta**(T - 20): a 1 % change in theta is a
+                          # ~15 % change in the rate at 5 degC, so Adam steps are 10x smaller
+                          "theta_r": 0.1, "theta_npp": 0.1, "theta_sod": 0.1}
+DEFAULT_PARAM_BOUND_FACTOR = {"k_min": 100.0, "k_max": 100.0, "seiche_alpha": 100.0,
+                              # fractions: keep <= 1 from their defaults (0.8 -> [0.64, 1.0]; 0.3 -> [0.09, 1.0])
+                              "beta_oc": 1.25, "LIGHTUSEBYPHOTOS": 1 / 0.3,
+                              # Arrhenius bases: 1.08 -> [1.038, 1.123] (default x10 would allow 0.108-10.8)
+                              "theta_r": 1.04, "theta_npp": 1.04, "theta_sod": 1.04}
 DEFAULT_BOUND_FACTOR = 10.0
 
 
 def parse_name_value_list(text, what):
-    """Parse 'name=value,name=value' into {name: float(value)}."""
+    """Parse 'name=value,name=value' (or name:value) into {name: float(value)}."""
     out = {}
     if not text:
         return out
@@ -351,10 +363,14 @@ def parse_name_value_list(text, what):
         item = item.strip()
         if not item:
             continue
-        if "=" not in item:
+        sep = "=" if "=" in item else (":" if ":" in item else None)
+        if sep is None:
             raise SystemExit(f"{what}: expected name=value, got {item!r}")
-        name, value = item.split("=", 1)
-        out[name.strip()] = float(value)
+        name, value = item.split(sep, 1)
+        try:
+            out[name.strip()] = float(value)
+        except ValueError:
+            raise SystemExit(f"{what}: value for {name.strip()!r} is not a number: {value!r}")
     return out
 
 # model_params.csv entries that default_params() actually threads into the
@@ -375,7 +391,9 @@ CANDIDATE_PARAMS = [
     "resp_docr", "resp_docl", "resp_pocr", "resp_pocl",
     "settling_rate_labile", "settling_rate_refractory",
     "f_sod", "d_thick", "meltP", "oc_load_factor", "k_min", "k_max", "alpha", "n", "Cd_bottom",
-    "seiche_alpha", "sbl_drho","W_str"
+    "seiche_alpha", "sbl_drho","W_str",
+    "npp_pmax", "npp_alpha", "npp_k_tp", "kgas_factor", "beta_oc", "LIGHTUSEBYPHOTOS",
+    "theta_sod",
 ]
 
 
@@ -386,12 +404,32 @@ CANDIDATE_PARAMS = [
 # step from light_water + light_doc*DOC + light_poc*POC in full_step).
 OBS_VARIABLES = ("temp", "o2", "doc", "poc", "kd")
 
+# Model fields compared against each observed variable (summed), and the
+# variables whose model state is a per-layer *mass* (g, conc * layer volume)
+# while the observations are concentrations (mg/L = g/m3). Losses and metrics
+# compare concentrations: model mass / layer volume vs observed mg/L, so every
+# layer counts equally (comparing masses weighted the residuals by volume^2,
+# i.e. surface layers ~550x more than near-bottom ones in Ravn).
+VAR_FIELDS = {"temp": ("u",), "o2": ("o2",), "doc": ("docr", "docl"), "poc": ("pocr", "pocl"),
+              "kd": ("kd_light",)}
+CONC_VARS = ("o2", "doc", "poc")
+
+
+def model_values(var, per_step, idx, volume):
+    """Model values comparable to the observations of `var` at the steps
+    `idx`: the sum of VAR_FIELDS[var], divided by the layer volume for the
+    mass variables in CONC_VARS (-> mg/L). Works on numpy and jax arrays."""
+    sim = sum(per_step[f][idx] for f in VAR_FIELDS[var])
+    return sim / volume if var in CONC_VARS else sim
+
 
 def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_config=None, temp_obs="all"):
     """Load temperature/O2/DOC observations, restrict to the simulation
     window, and build per-variable dicts of (step_idx, values, mask)
-    arrays on the model's depth grid. `values` are in the model's own
-    units: degC for temperature, mass (obs_mgL * volume) for o2/doc.
+    arrays on the model's depth grid. `values` are in observation units:
+    degC for temperature, mg/L (= g/m3) for o2/doc/poc -- the model's
+    per-layer masses are divided by layer volume before comparing
+    (`model_values`), so no conversion happens here.
     Returns a dict with keys "temp", "o2", "doc" (each None if no
     observations fall in the simulation window).
 
@@ -485,8 +523,8 @@ def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_c
 
     wq = load_water_quality_dataframe(data_dir, run_config)
     if wq is not None:
-        o2_obs = build(wq[wq["variable"] == "do"], "depth", "observation", mass_convert=True)
-        doc_obs = build(wq[wq["variable"] == "doc"], "depth", "observation", mass_convert=True)
+        o2_obs = build(wq[wq["variable"] == "do"], "depth", "observation", mass_convert=False)
+        doc_obs = build(wq[wq["variable"] == "doc"], "depth", "observation", mass_convert=False)
         # POC ("particulate organic carbon") is only present for some
         # datasets (e.g. Mendota's ME_obs_depths3_wpoc.csv has a "poc" row
         # per sample; Ravn's L0001-WQ.csv has no such rows at all) -- absent
@@ -494,7 +532,7 @@ def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_c
         # None below exactly like temp/o2/doc do when their own source rows
         # are missing. Compared against pocr+pocl combined (see extract_pairs/
         # make_loss_fn), mirroring how doc is compared against docr+docl.
-        poc_obs = build(wq[wq["variable"] == "poc"], "depth", "observation", mass_convert=True)
+        poc_obs = build(wq[wq["variable"] == "poc"], "depth", "observation", mass_convert=False)
         # Light extinction kd [1/m], optional like poc: one value per date.
         kd_obs = build_scalar(wq[wq["variable"] == "kd"], "observation")
     else:
@@ -504,8 +542,8 @@ def load_observations(data_dir, depth, volume, start_date, step_times, dt, run_c
 
 
 def obs_weight(obs):
-    """Inverse-variance weight so temperature (~degC) and mass-unit
-    O2/DOC (which can be many orders of magnitude larger) contribute
+    """Inverse-variance weight (1 / variance of the observations) so
+    temperature (degC) and O2/DOC/POC (mg/L) or kd (1/m) contribute
     comparably to a combined loss."""
     if obs is None:
         return 0.0
@@ -549,36 +587,25 @@ def _kge(sim, obs):
     return float(1 - np.sqrt((r - 1) ** 2 + (alpha - 1) ** 2 + (beta - 1) ** 2))
 
 
-def extract_pairs(per_step, obs):
+def extract_pairs(per_step, obs, volume):
     """Flatten the masked (sim, obs) pairs actually scored by the loss,
     per variable, as plain numpy arrays -- for RMSE/NSE/KGE/R2 reporting
     (metrics are computed outside of JAX; they're diagnostics, not part
-    of the differentiable loss)."""
+    of the differentiable loss). O2/DOC/POC in mg/L (model mass / volume)."""
     pairs = {}
-    if obs["temp"] is not None:
-        sim = np.asarray(per_step["u"][obs["temp"]["step_idx"]])
-        mask = np.asarray(obs["temp"]["mask"])
-        pairs["temp"] = (sim[mask], np.asarray(obs["temp"]["values"])[mask])
-    if obs["o2"] is not None:
-        sim = np.asarray(per_step["o2"][obs["o2"]["step_idx"]])
-        mask = np.asarray(obs["o2"]["mask"])
-        pairs["o2"] = (sim[mask], np.asarray(obs["o2"]["values"])[mask])
-    if obs["doc"] is not None:
-        sim = np.asarray(per_step["docr"][obs["doc"]["step_idx"]] + per_step["docl"][obs["doc"]["step_idx"]])
-        mask = np.asarray(obs["doc"]["mask"])
-        pairs["doc"] = (sim[mask], np.asarray(obs["doc"]["values"])[mask])
-    if obs["poc"] is not None:
-        sim = np.asarray(per_step["pocr"][obs["poc"]["step_idx"]] + per_step["pocl"][obs["poc"]["step_idx"]])
-        mask = np.asarray(obs["poc"]["mask"])
-        pairs["poc"] = (sim[mask], np.asarray(obs["poc"]["values"])[mask])
-    if obs.get("kd") is not None:
-        sim = np.asarray(per_step["kd_light"][obs["kd"]["step_idx"]])
-        mask = np.asarray(obs["kd"]["mask"])
-        pairs["kd"] = (sim[mask], np.asarray(obs["kd"]["values"])[mask])
+    vol = np.asarray(volume)
+    for var in OBS_VARIABLES:
+        o = obs.get(var)
+        if o is None:
+            continue
+        idx = np.asarray(o["step_idx"])
+        sim = np.asarray(model_values(var, {f: np.asarray(per_step[f]) for f in VAR_FIELDS[var]}, idx, vol))
+        mask = np.asarray(o["mask"])
+        pairs[var] = (sim[mask], np.asarray(o["values"])[mask])
     return pairs
 
 
-def compute_metrics(sim_fn, params, obs):
+def compute_metrics(sim_fn, params, obs, volume):
     """Run the model once at `params` via the already-`jax.jit`-compiled
     `sim_fn` (built once in `main()` from `simulate_truncated` and reused
     for both the initial and calibrated parameters -- same compiled
@@ -589,7 +616,7 @@ def compute_metrics(sim_fn, params, obs):
     function scores.
     """
     per_step = sim_fn(params)
-    pairs = extract_pairs(per_step, obs)
+    pairs = extract_pairs(per_step, obs, volume)
     metrics = {}
     for name, (sim, obsv) in pairs.items():
         metrics[name] = dict(
@@ -720,31 +747,22 @@ def simulate_truncated(params, geometry, forcing, ice_state, init_state, chunk_s
 
 
 def make_loss_fn(base_params, geometry, forcing, ice_state, init_state, obs, weights, chunk_steps):
+    """Combined loss: sum over variables of weights[var] * mean squared error
+    over that variable's scored values (O2/DOC/POC in mg/L, `model_values`)."""
+    volume = geometry["volume"]
+
     def loss_fn(theta_log):
         params = dict(base_params)
         params.update({name: jnp.exp(v) for name, v in theta_log.items()})
         per_step = simulate_truncated(params, geometry, forcing, ice_state, init_state, chunk_steps)
         total = 0.0
-        if obs["temp"] is not None:
-            sim = per_step["u"][obs["temp"]["step_idx"]]
-            err2 = (sim - obs["temp"]["values"]) ** 2 * obs["temp"]["mask"]
-            total = total + weights["temp"] * jnp.sum(err2) / jnp.maximum(jnp.sum(obs["temp"]["mask"]), 1.0)
-        if obs["o2"] is not None:
-            sim = per_step["o2"][obs["o2"]["step_idx"]]
-            err2 = (sim - obs["o2"]["values"]) ** 2 * obs["o2"]["mask"]
-            total = total + weights["o2"] * jnp.sum(err2) / jnp.maximum(jnp.sum(obs["o2"]["mask"]), 1.0)
-        if obs["doc"] is not None:
-            sim = per_step["docr"][obs["doc"]["step_idx"]] + per_step["docl"][obs["doc"]["step_idx"]]
-            err2 = (sim - obs["doc"]["values"]) ** 2 * obs["doc"]["mask"]
-            total = total + weights["doc"] * jnp.sum(err2) / jnp.maximum(jnp.sum(obs["doc"]["mask"]), 1.0)
-        if obs["poc"] is not None:
-            sim = per_step["pocr"][obs["poc"]["step_idx"]] + per_step["pocl"][obs["poc"]["step_idx"]]
-            err2 = (sim - obs["poc"]["values"]) ** 2 * obs["poc"]["mask"]
-            total = total + weights["poc"] * jnp.sum(err2) / jnp.maximum(jnp.sum(obs["poc"]["mask"]), 1.0)
-        if obs.get("kd") is not None:
-            sim = per_step["kd_light"][obs["kd"]["step_idx"]]
-            err2 = (sim - obs["kd"]["values"]) ** 2 * obs["kd"]["mask"]
-            total = total + weights["kd"] * jnp.sum(err2) / jnp.maximum(jnp.sum(obs["kd"]["mask"]), 1.0)
+        for var in OBS_VARIABLES:
+            o = obs.get(var)
+            if o is None:
+                continue
+            sim = model_values(var, per_step, o["step_idx"], volume)
+            err2 = (sim - o["values"]) ** 2 * o["mask"]
+            total = total + weights[var] * jnp.sum(err2) / jnp.maximum(jnp.sum(o["mask"]), 1.0)
         return total
 
     return loss_fn
@@ -756,32 +774,18 @@ def make_per_variable_loss_fn(base_params, geometry, forcing, ice_state, init_st
     weighted scalar -- one run of the model feeds `jax.jacrev` (a handful
     of extra backward passes, not a separate simulation per variable), used
     for the per-variable sensitivity ranking in `main()`."""
+    volume = geometry["volume"]
+
     def fn(theta_log):
         params = dict(base_params)
         params.update({name: jnp.exp(v) for name, v in theta_log.items()})
         per_step = simulate_truncated(params, geometry, forcing, ice_state, init_state, chunk_steps)
         losses = []
-        for name in var_names:
-            if name == "temp":
-                sim = per_step["u"][obs["temp"]["step_idx"]]
-                err2 = (sim - obs["temp"]["values"]) ** 2 * obs["temp"]["mask"]
-                losses.append(jnp.sum(err2) / jnp.maximum(jnp.sum(obs["temp"]["mask"]), 1.0))
-            elif name == "o2":
-                sim = per_step["o2"][obs["o2"]["step_idx"]]
-                err2 = (sim - obs["o2"]["values"]) ** 2 * obs["o2"]["mask"]
-                losses.append(jnp.sum(err2) / jnp.maximum(jnp.sum(obs["o2"]["mask"]), 1.0))
-            elif name == "doc":
-                sim = per_step["docr"][obs["doc"]["step_idx"]] + per_step["docl"][obs["doc"]["step_idx"]]
-                err2 = (sim - obs["doc"]["values"]) ** 2 * obs["doc"]["mask"]
-                losses.append(jnp.sum(err2) / jnp.maximum(jnp.sum(obs["doc"]["mask"]), 1.0))
-            elif name == "poc":
-                sim = per_step["pocr"][obs["poc"]["step_idx"]] + per_step["pocl"][obs["poc"]["step_idx"]]
-                err2 = (sim - obs["poc"]["values"]) ** 2 * obs["poc"]["mask"]
-                losses.append(jnp.sum(err2) / jnp.maximum(jnp.sum(obs["poc"]["mask"]), 1.0))
-            elif name == "kd":
-                sim = per_step["kd_light"][obs["kd"]["step_idx"]]
-                err2 = (sim - obs["kd"]["values"]) ** 2 * obs["kd"]["mask"]
-                losses.append(jnp.sum(err2) / jnp.maximum(jnp.sum(obs["kd"]["mask"]), 1.0))
+        for var in var_names:
+            o = obs[var]
+            sim = model_values(var, per_step, o["step_idx"], volume)
+            err2 = (sim - o["values"]) ** 2 * o["mask"]
+            losses.append(jnp.sum(err2) / jnp.maximum(jnp.sum(o["mask"]), 1.0))
         return jnp.stack(losses)
 
     return fn
@@ -790,10 +794,6 @@ def make_per_variable_loss_fn(base_params, geometry, forcing, ice_state, init_st
 # ---------------------------------------------------------------------------
 # Windowed calibration (--windows years): see src/windows.py
 # ---------------------------------------------------------------------------
-
-VAR_FIELDS = {"temp": ("u",), "o2": ("o2",), "doc": ("docr", "docl"), "poc": ("pocr", "pocl"),
-              "kd": ("kd_light",)}
-
 
 def parse_test_years(spec, years):
     """'' -> none; 'every:N' -> every N-th window year (counting from the
@@ -834,13 +834,15 @@ class WindowedLoss:
         self.states_theta = None
 
         sim, vars_ = self.sim, self.vars
+        volume = jnp.asarray(setup["geom"]["volume"])
+        self.volume = volume
 
         def per_window(theta, state0, forcing, obsw, scale):
             out = sim(theta, state0, forcing)
             total = 0.0
             for v in vars_:
                 o = obsw[v]
-                pred = sum(out[f] for f in VAR_FIELDS[v])[o["idx"]]
+                pred = model_values(v, out, o["idx"], volume)
                 total = total + scale[v] * jnp.sum((pred - o["val"]) ** 2 * o["mask"])
             return total
 
@@ -875,7 +877,7 @@ class WindowedLoss:
                     rs = []
                     for v in vars_:
                         o = obsw[v]
-                        pred = sum(out[f] for f in VAR_FIELDS[v])[o["idx"]]
+                        pred = model_values(v, out, o["idx"], self.volume)
                         rs.append((jnp.sqrt(scale[v]) * (pred - o["val"]) * o["mask"]).reshape(-1))
                     return jnp.concatenate(rs)
                 r = resid(theta)
@@ -961,6 +963,7 @@ def run_lm(args, wl, wl_test, all_idx, selected, theta_log0, log_lo, log_hi):
                       lam0=args.lm_lambda0, max_trials=args.lm_max_trials, max_step=args.lm_max_step,
                       ftol=args.early_stop_tol, xtol=args.lm_xtol, refresh=refresh,
                       refresh_every=args.refresh_every, validate=validate,
+                      stall_step=args.lm_stall_step, stall_iters=args.lm_stall_iters,
                       log=lambda m: print(m, flush=True))
     print(f"  LM stopped: {out['reason']}")
     x = out["x"]
@@ -1093,9 +1096,23 @@ def main():
                     help="max |step| per iteration in log units (0.5 = x/÷1.65; default 0.5)")
     lm.add_argument("--lm-jacobian-chunk", type=int, default=0,
                     help="truncate the Jacobian every N steps (0 = whole window, no truncation; default)")
+    lm.add_argument("--lm-stall-step", type=float, default=0.02,
+                    help="stop after --lm-stall-iters consecutive steps with max |dlog p| below this "
+                         "(default 0.02 ~ 2%%; works with --refresh-every 1, unlike the loss test)")
+    lm.add_argument("--lm-stall-iters", type=int, default=2, help="see --lm-stall-step (default 2; 0 = off)")
     lm.add_argument("--lm-xtol", type=float, default=1e-3,
                     help="stop when the largest log-parameter step is below this (default 1e-3 = 0.1%%)")
     args = parser.parse_args()
+    # check name lists now -- they used to be parsed only after the reference
+    # run and the baseline loss, so a typo failed ~15 minutes into a run
+    for text, what in ((args.lr_scale, "--lr-scale"), (args.bound_factor, "--bound-factor")):
+        bad = sorted(set(parse_name_value_list(text, what)) - set(CANDIDATE_PARAMS))
+        if bad:
+            parser.error(f"{what}: not in CANDIDATE_PARAMS: {bad}")
+    if args.params:
+        bad = sorted({p.strip() for p in args.params.split(",") if p.strip()} - set(CANDIDATE_PARAMS))
+        if bad:
+            parser.error(f"--params: not in CANDIDATE_PARAMS: {bad}")
     if args.optimizer == "lm":
         if args.windows != "years":
             parser.error("--optimizer lm needs --windows years")
@@ -1548,8 +1565,8 @@ def main():
     sim_fn = jax.jit(_sim_fn)
     base_params_sim = {k: v for k, v in base_params.items() if k != "diffusion_method"}
     params_final_sim = {k: v for k, v in params_final.items() if k != "diffusion_method"}
-    metrics_initial = compute_metrics(sim_fn, base_params_sim, obs)
-    metrics_final = compute_metrics(sim_fn, params_final_sim, obs)
+    metrics_initial = compute_metrics(sim_fn, base_params_sim, obs, geometry["volume"])
+    metrics_final = compute_metrics(sim_fn, params_final_sim, obs, geometry["volume"])
     print_metrics_table(
         "Evaluation metrics (computed at the same (step, depth) pairs the loss scores; "
         "NSE/KGE/R2: 1.0 = perfect fit):",

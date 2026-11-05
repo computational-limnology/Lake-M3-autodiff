@@ -1,50 +1,48 @@
 """
-Plot the process-based vs. LSTM-corrected eddy diffusivity (kz) from either
-  * a `train_M3_mcl_jax.py` result (mcl/mcl_result_<lake>.npz): baseline
-    run vs hybrid run, with the training/test windows shaded, or
-  * a `run_M3_mcl_jax.py` result (<lake>/res_lake1_mcl_hybrid.npz): there is
-    no separate baseline run in that file, so the "process-based" kz shown is
-    `kz_process`, the closure's own kz diagnosed along the hybrid trajectory
-    (i.e. what the closure asked for before the LSTM corrected it). A
-    baseline temperature can be added with `--baseline <res_lake1_jax_full.npz>`
-    (run_M3_jax.py output from the same start_time). By default the lake
-    folder's res_lake1_jax_full.npz is used when it covers the same run (same
-    number of steps and, when stored, the same start_time); without a
-    baseline only the hybrid temperature is plotted and PB metrics are NaN. No train/test shading (not stored).
-alongside a handful of
-single-time kz(depth) profiles and a temperature check at two depths
-against observations -- all in one figure.
+Plot the process-based vs. MCL-corrected eddy diffusivity (kz) and the
+resulting temperature fit, from any of
+  * a `train_M3_mcl_jax.py` result (mcl/mcl_result_<lake>.npz, LSTM
+    correction): separate process-based and hybrid runs, training/test
+    windows shaded;
+  * a `run_M3_mcl_jax.py` LSTM result (<lake>/res_lake1_mcl_hybrid.npz), or
+  * a regime-correction run from `train_mcl_regime.py` (--apply or the final
+    run; <lake>/res_lake1_mcl_regime.npz, or res_lake1_mcl_hybrid.npz when
+    written by run_M3_mcl_jax.py from an mcl_regime_<lake>.npz file).
+For the last two there is no separate process-based run in the file: the
+"process" kz shown is `kz_process`, the closure's own kz diagnosed along the
+corrected run (what the closure asked for before the correction). A
+process-based temperature (PB) can be added with `--baseline
+<res_lake1_jax_full.npz>` (run_M3_jax.py output, same start_time); by default
+the lake folder's res_lake1_jax_full.npz is used when it covers the same run.
+Without it only the corrected temperature is plotted and PB metrics are NaN.
+Regime files also store the TKE head's entrainment efficiency (eta); their
+coefficients are in mcl/mcl_regime_<lake>_coef.csv (the coefficient figure
+below is LSTM-only).
 
-Layout (one figure, three rows):
-  1. Two heatmaps, time x depth, sharing a log color scale: kz_baseline
-     (process-based `eddy_diffusivity_hendersonSellers`) and kz_hybrid
-     (process-based kz corrected by the trained LSTM -- see
-     `train_M3_mcl_jax.py`'s module docstring for the correction design).
-  2. A row of small panels, one per snapshot date (`--profile-dates` or
-     `--n-profile-dates` evenly-spaced defaults), each plotting kz(depth)
-     at that single time step for both baseline and hybrid on a shared
-     log-x/depth-y axis -- lets you see *where* and *by how much* the
-     network is adjusting mixing, rather than only the aggregate heatmap.
-  3. Temperature time series at two depths (`--depths`, default 1,30 m):
-     baseline and hybrid model temperature plus the observed record (read
-     via `plot_output._load_temperature_observations`, which follows
-     `run_config.csv`'s `u_ini_file` -- run `data_tools.py integrate-buoy`
-     once beforehand if the high-frequency buoy record should be included)
-     at the nearest observed depth, with the training/test windows shaded
-     for reference.
+Observations: `--temp-obs profiles` (default) uses the manual profiles only
+(high_frequency == 0, as for calibration/training); `all` adds the buoy record.
 
-Second figure (<out>_depths.png): one panel per observed depth with the PB
-(process-based) and MCL (hybrid) temperature at the nearest model layer and
-the observations, titled with RMSE/NSE/KGE of PB and MCL against the
-observations (nearest model hour). The same metrics -- also split into the
-train/test windows when the file has them -- are printed and written to
-<out>_depth_metrics.csv. Third figure (<out>_coefficients.png): the LSTM's
-correction coefficients.
+Main figure (<out>):
+  1. Two time x depth heatmaps on a shared log colour scale: process kz and
+     corrected kz (long runs block-averaged in time, geometric means).
+  2. kz(depth) snapshots at `--n-profile-dates` evenly spaced times (or
+     `--profile-dates`): process vs corrected -- where and by how much the
+     correction changes mixing.
+  3. Temperature at two depths (`--depths`, default 1,30 m): PB, MCL and the
+     observations at the nearest observed depth (lines are block means for
+     long runs; metrics always use the hourly series).
+Second figure (<out>_depths.png): one panel per observed depth, PB / MCL /
+observed, titled with RMSE, NSE and KGE of PB and MCL (nearest model hour);
+also printed and written to <out>_depth_metrics.csv (split into the training
+and test windows when the file has them).
+Third figure (<out>_coefficients.png, LSTM files only): the network's
+correction coefficients over time.
 
 Usage:
+    python mcl/plot_mcl_kz.py Ravn/res_lake1_mcl_regime.npz
     python mcl/plot_mcl_kz.py mcl/mcl_result_Ravn.npz
         [--depths 1,30] [--n-profile-dates 5] [--profile-dates DATE,DATE,...]
-        [--out Ravn/mcl_kz_plot.png]
+        [--temp-obs profiles|all] [--out Ravn/mcl_kz_plot.png]
 """
 # These MCL scripts live in <project>/mcl/; the model code they build on is
 # in <project>/src/, so put that on the import path first.
@@ -70,10 +68,36 @@ from plot_output import (
 )
 
 
-def load_mcl_result(path):
+# Large (time x depth) fields neither this script nor plot_ri_diagnostics.py
+# uses: not loaded (a full 1989-2024 run has ~160 MB per field; an
+# mcl_result file stores each twice, baseline and hybrid).
+SKIP_FIELDS = ("o2", "docr", "docl", "pocr", "pocl", "uvel", "vvel", "E_seiche")
+
+
+def load_mcl_result(path, skip=SKIP_FIELDS):
     with np.load(path) as d:
-        result = {k: np.asarray(d[k]) for k in d.files}
+        result = {}
+        for k in d.files:
+            base = k[:-len("_baseline")] if k.endswith("_baseline") else (k[:-len("_hybrid")] if k.endswith("_hybrid") else k)
+            if base in skip:
+                continue
+            result[k] = np.asarray(d[k])
     return normalize_result(result)
+
+
+def time_block_geomean(kz, max_cols):
+    """Geometric block mean over time so at most max_cols columns remain
+    (kz is shown on a log scale). Returns (reduced array, block length)."""
+    n = kz.shape[0]
+    if not max_cols or n <= max_cols:
+        return kz, 1
+    k = int(np.ceil(n / max_cols))
+    n_full = (n // k) * k
+    lk = np.log10(np.maximum(kz, 1e-12))
+    parts = [lk[:n_full].reshape(n_full // k, k, kz.shape[1]).mean(axis=1)]
+    if n_full < n:
+        parts.append(lk[n_full:].mean(axis=0)[None, :])
+    return 10.0 ** np.concatenate(parts, axis=0), k
 
 
 def normalize_result(result):
@@ -82,11 +106,14 @@ def normalize_result(result):
     through unchanged. Sets result["_source"] to "training" or "inference"."""
     if "kz_baseline" in result or "kz_hybrid" in result:
         result["_source"] = "training"
+        result["_correction"] = "LSTM"
         return result
     if "kz" not in result or "temp" not in result:
         raise KeyError("Neither a train_M3_mcl_jax.py result (kz_baseline/kz_hybrid) nor a "
                        "run_M3_mcl_jax.py result (kz/kz_process/temp) -- keys: " + ", ".join(sorted(result)))
     result["_source"] = "inference"
+    # regime runs (train_mcl_regime.py) store the TKE head's eta; LSTM runs the weights path
+    result["_correction"] = "regime" if ("eta" in result or "add_power_frac_wind" in result) else "LSTM"
     result["kz_hybrid"] = result["kz"]
     result["kz_baseline"] = result.get("kz_process", result["kz"])
     result["temp_hybrid"] = result["temp"]
@@ -138,13 +165,32 @@ def pick_profile_datetimes(model_datetimes, n, requested=None):
     return list(idx)
 
 
-def plot_kz_heatmap(ax, kz, model_datetimes, depth, norm, cmap, title):
+LINE_MAX_POINTS = 4000
+
+
+def thin_series(x, y, max_points=LINE_MAX_POINTS):
+    """Block means of a long hourly line for plotting (metrics always use the
+    full series). x: DatetimeIndex or array; returns (x_thin, y_thin)."""
+    n = len(y)
+    if n <= max_points:
+        return x, y
+    k = int(np.ceil(n / max_points))
+    m = (n // k) * k
+    yy = np.asarray(y, float)[:m].reshape(-1, k).mean(axis=1)
+    xx = x[:m][k // 2::k]
+    return xx, yy
+
+
+def plot_kz_heatmap(ax, kz, model_datetimes, depth, norm, cmap, title, max_cols=4000):
+    """Time x depth heatmap. Long runs are block-averaged (geometric mean) to
+    at most `max_cols` columns and drawn with imshow: pcolormesh on every
+    hour of a 36-year run needs ~1.3 GB per panel. The axis stays in
+    time-step units, so the date ticks are unchanged."""
     n_time, n_depth = kz.shape
-    mesh = ax.pcolormesh(
-        np.arange(n_time + 1), -np.arange(n_depth + 1), kz.T,
-        cmap=cmap, norm=norm, shading="auto",
-    )
-    ax.set_title(title)
+    reduced, block = time_block_geomean(kz, max_cols)
+    mesh = ax.imshow(reduced.T, cmap=cmap, norm=norm, aspect="auto", interpolation="nearest",
+                     extent=(0, n_time, -n_depth, 0), origin="upper")
+    ax.set_title(title if block == 1 else f"{title} ({block}-h geometric means)")
     ax.set_ylabel("Depth (m)")
     ytick_pos = -np.arange(n_depth)[::max(1, n_depth // 8)]
     ax.set_yticks(ytick_pos)
@@ -291,7 +337,7 @@ def depth_comparison(observations, model_datetimes, depth, temp_pb, temp_mcl,
 
 
 def plot_depth_comparison(series, table, model_datetimes, temp_pb, temp_mcl, depth,
-                          train_lo, train_hi, test_lo, test_hi, ncols=3):
+                          train_lo, train_hi, test_lo, test_hi, ncols=3, corr="MCL", obs_label="observations"):
     """Figure: one panel per observed depth with the full PB and MCL model
     series at the matched layer, the observations, and RMSE/NSE/KGE of both
     in the panel title (whole period)."""
@@ -305,8 +351,8 @@ def plot_depth_comparison(series, table, model_datetimes, temp_pb, temp_mcl, dep
         shade_windows(ax, model_datetimes, train_lo, train_hi, test_lo, test_hi)
         k = sr["layer"]
         if n_pb:
-            ax.plot(x[:n_pb], temp_pb[:n_pb, k], color="tab:gray", lw=0.9, label="PB")
-        ax.plot(x, temp_mcl[:, k], color="tab:red", lw=0.8, label="MCL")
+            ax.plot(*thin_series(x[:n_pb], temp_pb[:n_pb, k]), color="tab:gray", lw=0.9, label="PB")
+        ax.plot(*thin_series(x, temp_mcl[:, k]), color="tab:red", lw=0.8, label=f"MCL ({corr})")
         ax.scatter(sr["datetime"], sr["obs"], s=4, color="black", alpha=0.35, zorder=5, label="observed")
 
         def fmt(m):
@@ -318,13 +364,13 @@ def plot_depth_comparison(series, table, model_datetimes, temp_pb, temp_mcl, dep
                      f"{fmt('PB')}\n{fmt('MCL')}", fontsize=8)
         ax.grid(alpha=0.3)
         if i % ncols == 0:
-            ax.set_ylabel("T (deg C)")
+            ax.set_ylabel("Temperature (°C)")
         if i == 0:
             ax.legend(fontsize=7, loc="upper left", markerscale=3)
     for j in range(n, nrows * ncols):
         axes[j // ncols, j % ncols].set_visible(False)
-    fig.suptitle("Temperature per observed depth: process-based (PB) vs MCL hybrid vs observations "
-                 "(metrics over the whole modelled period)", fontsize=12)
+    fig.suptitle(f"Temperature per observed depth: process-based (PB) vs MCL ({corr}) vs {obs_label} "
+                 "(metrics over the whole modelled period, nearest model hour)", fontsize=12)
     fig.autofmt_xdate()
     fig.tight_layout(rect=(0, 0, 1, 0.98))
     return fig
@@ -349,7 +395,9 @@ def print_depth_table(table):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("result_path", help="Path to mcl_result.npz (from train_M3_mcl_jax.py).")
+    parser.add_argument("result_path", help="MCL result: mcl/mcl_result_<lake>.npz (train_M3_mcl_jax.py), "
+                         "<lake>/res_lake1_mcl_hybrid.npz (run_M3_mcl_jax.py) or "
+                         "<lake>/res_lake1_mcl_regime.npz (train_mcl_regime.py)")
     parser.add_argument("--depths", type=str, default="1,30",
                          help="Comma-separated depths (meters) for the temperature time-series "
                               "panels (default: 1,30). Each is snapped to the nearest model depth "
@@ -386,6 +434,12 @@ def main():
     parser.add_argument("--data-dir", type=str, default=None,
                          help="lake data folder (run_config.csv, observations); default: the "
                               "result's folder, or for mcl/<name>_<lake>.npz the folder <lake>")
+    parser.add_argument("--temp-obs", choices=("profiles", "all"), default="profiles",
+                         help="temperature observations: 'profiles' (default; manual profiles only, as used "
+                              "for calibration/training) or 'all' (adds the high-frequency buoy rows)")
+    parser.add_argument("--heatmap-max-cols", type=int, default=4000,
+                         help="max time columns in the kz heatmaps (block geometric means; default 4000, "
+                              "0 = every step, ~1.3 GB RAM per panel for a 36-year hourly run)")
     args = parser.parse_args()
 
     result = load_mcl_result(args.result_path)
@@ -403,8 +457,8 @@ def main():
     temp_hybrid = result["temp_hybrid"]
     inference = result["_source"] == "inference"
     if inference:
-        print("run_M3_mcl_jax.py output: 'process-based' kz = kz_process diagnosed along the hybrid run "
-              "(no separate baseline run in this file); no train/test windows stored.")
+        print("Corrected run without a separate process-based run in the file: 'process' kz = kz_process "
+              "diagnosed along the corrected run; no train/test windows stored.")
         baseline_path = args.baseline
         if baseline_path is None and not args.no_baseline:
             # default: the plain run_M3_jax.py output in the lake folder, if it
@@ -464,6 +518,16 @@ def main():
         parser.error("--depths expects exactly two comma-separated values, e.g. '1,30'")
 
     observations = _load_temperature_observations(data_dir, args.observations)
+    if observations is not None and args.temp_obs == "profiles":
+        if "high_frequency" in observations.columns:
+            n_all = len(observations)
+            observations = observations[observations["high_frequency"].fillna(0).astype(int) == 0]
+            print(f"Temperature observations: manual profiles only ({len(observations)} of {n_all} rows)")
+        else:
+            print("--temp-obs profiles: no high_frequency column -- using all rows")
+    obs_label = "manual profiles" if args.temp_obs == "profiles" else "all observations incl. buoy"
+    corr = result.get("_correction", "LSTM")
+    corr_txt = {"regime": "regime correction (kz + TKE heads)", "LSTM": "LSTM correction"}[corr]
 
     # --- figure layout ---
     fig = plt.figure(figsize=(20, 17))
@@ -478,27 +542,27 @@ def main():
     cmap = plt.colormaps.get_cmap("viridis")
 
     ax_base = fig.add_subplot(top[0, 0])
-    base_title = ("kz_process: closure kz along the hybrid run (before correction)" if inference
-                  else "kz: process-based baseline run")
-    mesh = plot_kz_heatmap(ax_base, kz_baseline, model_datetimes, depth, norm, cmap, base_title)
+    base_title = ("Process kz along the corrected run" if inference else "Process kz (process-based run)")
+    mesh = plot_kz_heatmap(ax_base, kz_baseline, model_datetimes, depth, norm, cmap, base_title,
+                           max_cols=args.heatmap_max_cols)
     ax_hyb = fig.add_subplot(top[0, 1])
     plot_kz_heatmap(ax_hyb, kz_hybrid, model_datetimes, depth, norm, cmap,
-                     "kz: process + LSTM correction")
-    fig.colorbar(mesh, ax=[ax_base, ax_hyb], label="kz (m^2/s, log scale)", fraction=0.025, pad=0.02)
+                     f"Corrected kz ({corr} correction)", max_cols=args.heatmap_max_cols)
+    fig.colorbar(mesh, ax=[ax_base, ax_hyb], label="kz (m² s⁻¹, log scale)", fraction=0.025, pad=0.02)
 
     # Row 2: kz(depth) snapshots
     n_panels = len(profile_idx)
     mid = outer[1].subgridspec(1, n_panels, wspace=0.15)
     for i, idx in enumerate(profile_idx):
         ax = fig.add_subplot(mid[0, i])
-        ax.plot(kz_baseline[idx], -depth, label="kz_process (hybrid run)" if inference else "process-based",
+        ax.plot(kz_baseline[idx], -depth, label="process kz (along corrected run)" if inference else "process kz",
                 color="tab:gray", lw=1.8)
-        ax.plot(kz_hybrid[idx], -depth, label="process + LSTM", color="tab:red", lw=1.5, ls="--")
+        ax.plot(kz_hybrid[idx], -depth, label="corrected kz", color="tab:red", lw=1.5, ls="--")
         ax.set_xscale("log")
         ax.set_xlim(vmin, vmax)
         label = model_datetimes[idx].strftime("%Y-%m-%d %H:%M") if model_datetimes is not None else f"step {idx}"
         ax.set_title(label, fontsize=9)
-        ax.set_xlabel("kz (m^2/s)")
+        ax.set_xlabel("kz (m² s⁻¹)")
         if i == 0:
             ax.set_ylabel("Depth (m)")
             ax.set_yticks(-depth[::max(1, n_depth // 8)])
@@ -530,24 +594,25 @@ def main():
             nearest_obs_depth = float(obs_depths[np.argmin(np.abs(obs_depths - target_depth))])
             obs_here = obs_windowed[obs_windowed["Depth_meter"] == nearest_obs_depth]
             ax.scatter(obs_here["datetime"], obs_here["Water_Temperature_celsius"],
-                       label=f"observed ({nearest_obs_depth:g} m)", color="black", s=10, zorder=3, alpha=0.2)
+                       label=f"observed, {obs_label} ({nearest_obs_depth:g} m)", color="black", s=10, zorder=3,
+                       alpha=0.2)
         
         if temp_baseline is not None:
             nb_ = min(len(x), temp_baseline.shape[0])
-            ax.plot(x[:nb_], temp_baseline[:nb_, model_idx], label="baseline (process-based kz)",
+            ax.plot(*thin_series(x[:nb_], temp_baseline[:nb_, model_idx]), label="PB (process-based run)",
                     color="tab:gray", lw=1.2, zorder=8)
-        ax.plot(x, temp_hybrid[:, model_idx], label="hybrid (process + LSTM kz)",
+        ax.plot(*thin_series(x, temp_hybrid[:, model_idx]), label=f"MCL ({corr})",
                 color="tab:red", lw=1.0, zorder = 10)
         
         ax.set_title(f"Temperature at {depth[model_idx]:g} m (nearest to {target_depth:g} m)")
-        ax.set_ylabel("Temperature (deg C)")
+        ax.set_ylabel("Temperature (°C)")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
         if model_datetimes is not None:
             fig.autofmt_xdate()
 
-    fig.suptitle("Process-based vs. LSTM-corrected eddy diffusivity (kz), and resulting temperature fit",
-                 fontsize=14)
+    fig.suptitle(f"Eddy diffusivity: process-based vs. {corr_txt}, and the resulting temperature fit "
+                 f"(observations: {obs_label})", fontsize=14)
 
     out_path = args.out or os.path.join(
         result_dir, os.path.splitext(os.path.basename(args.result_path))[0] + "_kz_plot.png")
@@ -567,7 +632,8 @@ def main():
             table.to_csv(table_path, index=False)
             print(f"Saved per-depth metrics to {table_path}")
             depth_fig = plot_depth_comparison(series, table, model_datetimes, temp_baseline, temp_hybrid, depth,
-                                              train_lo, train_hi, test_lo, test_hi, ncols=args.depth_cols)
+                                              train_lo, train_hi, test_lo, test_hi, ncols=args.depth_cols,
+                                              corr=corr, obs_label=obs_label)
             depth_path = f"{root}_depths{ext or '.png'}"
             depth_fig.savefig(depth_path, dpi=130, bbox_inches="tight")
             print(f"Saved per-depth temperature figure to {depth_path}")
@@ -575,6 +641,9 @@ def main():
         print("No observations in the modelled period -- per-depth comparison skipped.")
 
     coef_fig = plot_coefficients(result, model_datetimes, train_lo, train_hi, test_lo, test_hi)
+    if coef_fig is None and corr == "regime":
+        print("Coefficient figure: LSTM files only; the regime coefficients are in "
+              "mcl/mcl_regime_<lake>_coef.csv.")
     if coef_fig is not None:
         root, ext = os.path.splitext(out_path)
         coef_path = f"{root}_coefficients{ext or '.png'}"

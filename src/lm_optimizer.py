@@ -34,13 +34,24 @@ def lm_step(x, A, g, lam, lo, hi, max_step=0.5, d_floor=1e-12):
     """Damped Gauss-Newton step from x. Returns (delta, predicted_reduction).
     `lo`/`hi` are bounds on x, `max_step` caps max|delta| (log units)."""
     A = np.asarray(A, float); g = np.asarray(g, float); x = np.asarray(x, float)
-    d = np.diag(A).copy()
+    lo = np.asarray(lo, float); hi = np.asarray(hi, float)
+    # parameters sitting at a bound with the gradient pushing them outward are
+    # held fixed (projected step); otherwise the clipped step would be the same
+    # for every lam and each retry would waste a loss evaluation
+    tol = 1e-12 * np.maximum(1.0, np.abs(x))
+    active = ((x <= lo + tol) & (g > 0)) | ((x >= hi - tol) & (g < 0))
+    free = ~active
+    delta = np.zeros_like(x)
+    if not free.any():
+        return delta, 0.0
+    Af, gf = A[np.ix_(free, free)], g[free]
+    d = np.diag(Af).copy()
     d = np.maximum(d, d_floor * max(d.max(), 1e-300))
-    M = A + lam * np.diag(d)
+    M = Af + lam * np.diag(d)
     try:
-        delta = -np.linalg.solve(M, g)
+        delta[free] = -np.linalg.solve(M, gf)
     except np.linalg.LinAlgError:
-        delta = -np.linalg.lstsq(M, g, rcond=None)[0]
+        delta[free] = -np.linalg.lstsq(M, gf, rcond=None)[0]
     m = np.max(np.abs(delta))
     if max_step and m > max_step:
         delta = delta * (max_step / m)
@@ -57,7 +68,7 @@ def nielsen_update(lam, nu, rho, accepted, lam_min=1e-12):
 
 def lm_minimize(normal_eq, loss, x0, lo, hi, names=None, max_iters=20, lam0=1e-2, max_trials=4,
                 max_step=0.5, ftol=1e-4, xtol=1e-3, lam_max=1e8, refresh=None, refresh_every=0,
-                validate=None, log=print):
+                validate=None, log=print, stall_step=0.02, stall_iters=2):
     """Run LM from x0 (1-D array).
 
     normal_eq(x) -> (A, g, L)   L = sum r^2 at x (same start states as `loss`)
@@ -65,6 +76,10 @@ def lm_minimize(normal_eq, loss, x0, lo, hi, names=None, max_iters=20, lam0=1e-2
     refresh(x)   optional; called after every `refresh_every` accepted steps
                  (windowed runs: new start states). The loss is re-scored after.
     validate(x)  optional; returns a held-out loss to print (not used for decisions)
+    stall_step, stall_iters: stop after `stall_iters` consecutive accepted
+                 steps with max|step| < stall_step (log units, 0.02 ~ 2 %). Unlike
+                 the loss test (ftol), this also works when start states are
+                 refreshed every step, which makes successive losses incomparable.
 
     Returns dict(x, loss, A, g, lam, history (DataFrame), reason)."""
     names = list(names) if names is not None else [f"x{i}" for i in range(len(x0))]
@@ -80,6 +95,7 @@ def lm_minimize(normal_eq, loss, x0, lo, hi, names=None, max_iters=20, lam0=1e-2
     log(f"  LM iter   0: loss={L:.6g}" + (f"  test={v:.6g}" if v is not None else "")
         + "  grad=" + " ".join(f"{n}:{2 * gi:+.3g}" for n, gi in zip(names, g)))
     n_acc = 0
+    n_small = 0   # consecutive accepted steps below stall_step
     for it in range(1, max_iters + 1):
         accepted = False
         for trial in range(1, max_trials + 1):
@@ -124,6 +140,11 @@ def lm_minimize(normal_eq, loss, x0, lo, hi, names=None, max_iters=20, lam0=1e-2
             break
         if step < xtol:
             reason = f"max parameter step < {xtol:g} (log units, ~{100 * xtol:.2g}%)"
+            break
+        n_small = n_small + 1 if (stall_step and step < stall_step) else 0
+        if stall_iters and n_small >= stall_iters:
+            reason = (f"{n_small} consecutive steps with max|dlog p| < {stall_step:g} "
+                      f"(~{100 * stall_step:.2g}%) -- parameters no longer moving")
             break
     return dict(x=x, loss=L, A=A, g=g, lam=lam, history=pd.DataFrame(rows), reason=reason)
 

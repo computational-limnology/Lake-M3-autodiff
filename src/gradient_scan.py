@@ -15,8 +15,9 @@ What is computed
       g_w,p  = d loss_w / d log(p)                      (= p * d loss_w / d p)
 
   weight_v = 1 / var(obs_v) over the record, as in the calibration
-  (obs_weight). g is dimensionless and comparable across parameters and
-  years: g = 1 means a 1 % increase of p changes the window's normalised
+  (obs_weight). O2/DOC/POC are compared as concentrations (model mass / layer
+  volume vs mg/L), as in calibrate_M3_jax.py. g is dimensionless and
+  comparable across parameters and years: g = 1 means a 1 % increase of p changes the window's normalised
   loss by ~0.01. The calibration's (pooled) gradient is the
   observation-weighted mean of the window gradients, sum_w (n_w / N) g_w; it
   is printed as a cross-check.
@@ -60,8 +61,12 @@ def _early_device_flags(argv):
     if "--multi-thread" not in argv and "xla_cpu_multi_thread_eigen" not in flags:
         flags += " --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
     os.environ["XLA_FLAGS"] = flags.strip()
-    if "--xla-warnings" not in argv:   # hide "may be stuck / unstuck" spam with several devices
+    if "--xla-warnings" not in argv and n > 1:   # hide "may be stuck / unstuck" spam with several devices
         os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+        # newer jaxlib versions log these via absl, which ignores TF_CPP_MIN_LOG_LEVEL:
+        # filter them out of stderr directly (see xla_log_filter.py)
+        import xla_log_filter
+        xla_log_filter.install()
 
 
 if __name__ == "__main__":
@@ -75,7 +80,7 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 
 import windows as W  # noqa: E402
-from calibrate_M3_jax import VAR_FIELDS, obs_weight  # noqa: E402
+from calibrate_M3_jax import VAR_FIELDS, obs_weight, model_values  # noqa: E402
 
 DEFAULT_PARAMS = ("wind_factor", "seiche_alpha", "k_max")
 
@@ -101,6 +106,7 @@ def make_scan(setup, windows_df, variables, weights, chunk_steps, window_steps, 
         m = o["mask"] & o["valid"].reshape(o["valid"].shape + (1,) * (o["mask"].ndim - 2))
         OBS[v] = dict(idx=o["step_idx"], val=o["values"], mask=m.astype(float))
         counts[v] = OBS[v]["mask"].reshape(len(windows_df), -1).sum(axis=1)
+    volume = jnp.asarray(setup["geom"]["volume"])   # O2/DOC/POC compared in mg/L (model mass / volume)
     # each window's own mean loss: weight_v / n_v,w
     scale = {v: jnp.asarray(weights[v] / np.maximum(counts[v], 1.0)) for v in variables}
 
@@ -109,7 +115,7 @@ def make_scan(setup, windows_df, variables, weights, chunk_steps, window_steps, 
         total, sse = 0.0, {}
         for v in variables:
             o = obsw[v]
-            pred = sum(out[f] for f in VAR_FIELDS[v])[o["idx"]]
+            pred = model_values(v, out, o["idx"], volume)
             sse[v] = jnp.sum((pred - o["val"]) ** 2 * o["mask"])
             total = total + sc[v] * sse[v]
         return total, sse

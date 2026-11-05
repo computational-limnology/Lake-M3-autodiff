@@ -261,7 +261,7 @@ for lake_num in range(1, num_lakes + 1):
 
         # general physical constants
         p2=model_params["p2"],
-        B=model_params["B"],
+        beta=float(model_params.get("beta_oc", 0.8)),  # replaces the unused row B (dead argument of run_wq_model)
         g=model_params["g"],
         meltP=model_params["meltP"],
     )

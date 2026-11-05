@@ -761,8 +761,27 @@ def _time_block_mean(arr, max_cols):
     return np.concatenate(parts, axis=0), k
 
 
+def _filter_temperature_observations(observations, temp_obs="all"):
+    """`temp_obs`: "all" keeps every row; "profiles" keeps only the sparse
+    manual profiles (high_frequency == 0), i.e. drops the buoy record -- the
+    same selection as calibrate_M3_jax.py --temp-obs profiles. Without a
+    high_frequency column all rows are kept (with a note)."""
+    if observations is None or temp_obs == "all":
+        return observations
+    if temp_obs != "profiles":
+        raise ValueError(f"temp_obs must be 'all' or 'profiles', got {temp_obs!r}")
+    if "high_frequency" not in observations.columns:
+        print("--temp-obs profiles: no high_frequency column in the observations -- using all rows "
+              "(run `python src/data_tools.py flag-hf <lake>` to add it).")
+        return observations
+    kept = observations[observations["high_frequency"].fillna(0).astype(int) == 0]
+    print(f"Temperature observations: manual profiles only ({len(kept)} of {len(observations)} rows; "
+          "high-frequency rows excluded)")
+    return kept
+
+
 def plot_result(path, observations_path=None, water_quality_observations_path=None, depths=None,
-                 series=None, bias_map_obs="profiles", max_heatmap_cols=4000):
+                 series=None, bias_map_obs="profiles", max_heatmap_cols=4000, temp_obs="all"):
     res = load_result(path)
     if not isinstance(res, dict):
         raise TypeError(f"Expected a dictionary-like result, got {type(res).__name__}")
@@ -854,12 +873,13 @@ def plot_result(path, observations_path=None, water_quality_observations_path=No
         axes[j].axis("off")
 
     plt.tight_layout()
-    observations = _load_temperature_observations(path, observations_path)
+    observations_all = _load_temperature_observations(path, observations_path)
+    observations = _filter_temperature_observations(observations_all, temp_obs)
     _plot_temperature_profiles(temp, time_values, depth_values, observations, start_time, depths=depths)
     if bias_map_obs != "none":
         resolved = _resolve_input_path(path)
         _plot_layer_bias_map(
-            temp, time_values, depth_values, observations, start_time, obs_mode=bias_map_obs,
+            temp, time_values, depth_values, observations_all, start_time, obs_mode=bias_map_obs,
             label=os.path.splitext(os.path.basename(resolved))[0],
             save_path=os.path.splitext(resolved)[0] + "_bias_map.png" if os.path.isfile(resolved) else None)
 
@@ -995,6 +1015,15 @@ def main():
         "without the buoy record), 'all', or 'none' to skip it.",
     )
     parser.add_argument(
+        "--temp-obs",
+        choices=["all", "profiles"],
+        default="all",
+        help="temperature observations for the time-series panels, scatter and metrics: 'all' "
+        "(default; manual profiles + high-frequency buoy rows) or 'profiles' (only rows with "
+        "high_frequency == 0, as calibrate_M3_jax.py --temp-obs profiles). The bias map has its "
+        "own --bias-map-obs.",
+    )
+    parser.add_argument(
         "--heatmap-max-cols",
         type=int,
         default=4000,
@@ -1017,7 +1046,7 @@ def main():
     plot_result(
         args.path, args.observations, args.water_quality_observations, depths=depths,
         series=args.series, bias_map_obs=args.bias_map_obs,
-        max_heatmap_cols=args.heatmap_max_cols,
+        max_heatmap_cols=args.heatmap_max_cols, temp_obs=args.temp_obs,
     )
 
 

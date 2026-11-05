@@ -39,6 +39,9 @@ three different names, by design.
 Usage:
     python mcl/run_M3_mcl_jax.py Ravn [--nn-params mcl_nn_params.pkl]   # -> mcl/mcl_nn_params_Ravn.pkl
         [--steps N] [--chunk-steps N] [--out res_lake1_mcl_hybrid.npz]
+    python mcl/run_M3_mcl_jax.py Ravn --nn-params mcl_regime.npz        # -> mcl/mcl_regime_Ravn.npz
+        (a regime correction from mcl/train_mcl_regime.py; run over the full
+        record and scored per train/val/test split with thermocline metrics)
 
 `--chunk-steps` only controls the memory/`jax.checkpoint` granularity of the
 underlying scan (see `simulate_hybrid()`'s module-level docstring in
@@ -134,6 +137,18 @@ def main():
             f"{nn_params_path} not found -- train a model first with train_M3_mcl_jax.py "
             "(--nn-params-out picks where it saves the weights this script loads)."
         )
+    if nn_params_path.endswith(".npz"):
+        # regime correction from mcl/train_mcl_regime.py (coefficients, not LSTM
+        # weights): run it with that script's own continuous runner
+        _mcl_dir = _os.path.dirname(_os.path.abspath(__file__))
+        if _mcl_dir not in _sys.path:
+            _sys.path.insert(0, _mcl_dir)
+        import train_mcl_regime
+        if args.steps is not None or args.chunk_steps is not None:
+            print("Note: --steps/--chunk-steps are ignored for regime corrections (full record is run).")
+        print(f"Regime correction file {nn_params_path} (train_mcl_regime.py format)")
+        train_mcl_regime.apply_file(os.getcwd(), nn_params_path, res_out=os.path.abspath(args.out))
+        return
     with open(nn_params_path, "rb") as f:
         trained = pickle.load(f)
 
